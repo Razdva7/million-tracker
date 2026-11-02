@@ -16,8 +16,13 @@ def sec(k):
 
 pw = sec("password")
 if pw and not st.session_state.get("ok"):
-    if st.text_input("Пароль", type="password") == pw:
-        st.session_state.ok = True; st.rerun()
+    with st.form("login"):
+        p = st.text_input("Пароль", type="password")
+        if st.form_submit_button("Войти", type="primary"):
+            if p.strip() == str(pw).strip():
+                st.session_state.ok = True; st.rerun()
+            else:
+                st.error("Неверный пароль")
     st.stop()
 
 # ---------- хранилище: GitHub-репозиторий (если заданы secrets) или локальный файл ----------
