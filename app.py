@@ -215,32 +215,37 @@ with tv:
         up = st.file_uploader("Скриншот списка трат — считаются тратами за выбранный день", type=["png", "jpg", "jpeg"]); sd = st.date_input("Дата трат", today, key="sd")
         if up:
             st.image(up, width=240)
-            if st.button("Распознать", type="primary"):
-                pb = st.progress(0.0, text="Загружаю модель… при первом запуске 1–2 минуты")
-                try:
-                    st.session_state.shot_txt = shot.read_image(up.getvalue(), sec("hf_model") or shot.MODEL, sec("hf_token"), pb)
-                    st.session_state.shot_rows = shot.parse(st.session_state.shot_txt, D["cats"], D["exp"]); pb.empty()
-                except Exception as e: pb.empty(); st.error(f"Не удалось распознать: {e}")
-        if "shot_txt" in st.session_state:
-            with st.expander("Распознанный текст (можно поправить)"):
-                st.text_area("Текст", key="shot_txt", height=140, label_visibility="collapsed")
-                if st.button("Разобрать текст заново"): st.session_state.shot_rows = shot.parse(st.session_state.shot_txt, D["cats"], D["exp"]); st.rerun()
-        rows = st.session_state.get("shot_rows")
-        if rows is not None:
-            lab = {c: f"{D['cats'][c]} · {c}" for c in order}; seen = {(e["d"], e["c"], e["a"]) for e in D["exp"]}
-            T = pd.DataFrame([{"Добавить": (str(sd), r_["c"], r_["a"]) not in seen, "Описание": r_["n"], "Сумма": r_["a"], "Категория": lab.get(r_["c"], lab.get("Другое", next(iter(lab.values()), "")))} for r_ in rows], columns=["Добавить", "Описание", "Сумма", "Категория"])
-            if not len(T): st.warning("Трат не найдено. Поправь распознанный текст выше или добавь строки в таблицу вручную.")
-            st.caption("Проверь список: поправь описание, сумму и категорию, лишнее удали. Новые строки — внизу таблицы. Галочка снята у возможных дублей.")
-            ed = st.data_editor(T, num_rows="dynamic", hide_index=True, width="stretch", key="shotT", column_config={"Добавить": st.column_config.CheckboxColumn("✓"),
-                "Сумма": st.column_config.NumberColumn("Сумма", min_value=0.0), "Категория": st.column_config.SelectboxColumn("Группа · категория", options=list(lab.values()))})
-            if st.button("Добавить траты", type="primary"):
-                n_ = 0
-                for _, r_ in ed.iterrows():
-                    if (pd.isna(r_["Добавить"]) or r_["Добавить"]) and pd.notna(r_["Сумма"]) and r_["Сумма"] > 0:
-                        cat = str(r_["Категория"]).split(" · ", 1)[-1]; add("exp", d=str(sd), c=cat if cat in D["cats"] else "Другое", a=float(r_["Сумма"]), n="" if pd.isna(r_["Описание"]) else str(r_["Описание"])); n_ += 1
-                st.session_state.pop("shot_rows", None); st.session_state.pop("shot_txt", None)
-                if n_: commit()
-                st.rerun()
+            
+if st.button("Распознать", type="primary"):
+    pb = st.progress(0.0, text="Загружаю модель… при первом запуске 1–2 минуты")
+    try:
+        st.session_state.shot_txt = read_image(
+            up.getvalue(),
+            sec("hf_model") or MODEL,
+            sec("hf_token"),
+            pb
+        )
+        st.session_state.shot_rows = parse(
+            st.session_state.shot_txt,
+            D["cats"],
+            D["exp"]
+        )
+        pb.empty()
+    except Exception as e:
+        pb.empty()
+        st.error(f"Не удалось распознать: {e}")
+
+if "shot_txt" in st.session_state:
+    with st.expander("Распознанный текст (можно поправить)"):
+        st.text_area("Текст", key="shot_txt", height=140, label_visibility="collapsed")
+        if st.button("Разобрать текст заново"):
+            st.session_state.shot_rows = parse(
+                st.session_state.shot_txt,
+                D["cats"],
+                D["exp"]
+            )
+            st.rerun()
+
 
 # ================= Аналитика =================
 with ta:
