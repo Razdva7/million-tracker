@@ -1,5 +1,6 @@
 import json, base64, os, re, time, random, calendar, datetime as dt
 import requests, pandas as pd, altair as alt, streamlit as st
+from shot import read_image, parse, MODEL
 
 st.set_page_config(page_title="Путь к миллиону", page_icon="💰")
 st.markdown("""<style>.block-container{padding:.7rem .8rem 3rem;max-width:780px}h1,h2,h3{margin:0;padding:.25rem 0}
