@@ -212,7 +212,6 @@ with tv:
         if mm in D["inc"] and c2.button("Сбросить к стандартному"): del D["inc"][mm]; commit()
         st.caption(f"Стандартный доход: {R(cfg['income'])}. Доп. доходы вносятся отдельно и прибавляются.")
     if kind == "Скриншот":
-        import shot
         up = st.file_uploader("Скриншот списка трат — считаются тратами за выбранный день", type=["png", "jpg", "jpeg"]); sd = st.date_input("Дата трат", today, key="sd")
         if up:
             st.image(up, width=240)
