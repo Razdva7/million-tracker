@@ -1,5 +1,12 @@
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
 streamlit>=1.50
 pandas
 altair>=5
 openpyxl
 requests
+torch
+transformers>=4.46
+pillow
+num2words
+huggingface_hub
