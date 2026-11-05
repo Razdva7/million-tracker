@@ -1,10 +1,11 @@
 import json
 import re
-import base64
 import os
 import time
+import uuid
 import random
 import calendar
+import traceback
 import datetime as dt
 from collections.abc import Mapping
 
@@ -13,17 +14,17 @@ import pandas as pd
 import altair as alt
 import streamlit as st
 
+APP_VERSION = "7.0"
 
 # ========================= Настройки интерфейса =========================
 
 st.set_page_config(page_title="Путь к миллиону", page_icon="💰")
-# st.html — стили не превращаются в текст (в markdown отступы делают из <style> блок кода)
 st.html(
     "<style>.block-container{padding:.7rem .8rem 3rem;max-width:780px}"
     "h1,h2,h3{margin:0;padding:.25rem 0}"
     "[data-testid=stMetricValue]{font-size:1.25rem}[data-testid=stMetricLabel]{font-size:.8rem}"
     "[data-testid=stHeader]{height:1.8rem}div[data-testid=stVerticalBlock]{gap:.55rem}"
-    ".stTabs [data-baseweb=tab]{padding:.4rem .5rem}</style>"
+    ".stButton button{border-radius:14px}</style>"
 )
 
 GREEN, RED, BLUE = "#10b981", "#ef4444", "#3b82f6"
@@ -44,6 +45,29 @@ G0 = {
     "Прочее": ["Дом", "Другое", "Образование"],
 }
 MN = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+
+ICONS = [
+    "🛒", "🍽️", "🍕", "☕", "🍺", "🥦", "🚌", "🚇", "🚕", "🚗", "⛽", "🏠", "💡", "📱", "🛡️", "🎓",
+    "📚", "💊", "🧴", "💇", "👗", "🎁", "❤️", "🎬", "🎮", "✈️", "🏖️", "📺", "💻", "🔧", "🐶", "👶",
+    "💰", "🏦", "📦", "🧾", "🏋️", "🧹", "🤝", "🏷️",
+]
+COLORS = {
+    "Зелёный": "#10b981", "Синий": "#3b82f6", "Красный": "#ef4444", "Оранжевый": "#f97316",
+    "Жёлтый": "#eab308", "Фиолетовый": "#8b5cf6", "Розовый": "#ec4899", "Бирюзовый": "#14b8a6",
+    "Серый": "#6b7280", "Коричневый": "#92400e",
+}
+DEFAULT_ICON = {
+    "Продукты": "🛒", "Обед на работе": "🍽️", "Кафе": "🍕", "Кофе": "☕", "Алкоголь": "🍺",
+    "Проезд на работу": "🚌", "Транспорт": "🚇", "Такси": "🚕", "Ипотека": "🏠", "Кварплата": "💡",
+    "Связь": "📱", "Страховка": "🛡️", "Учеба в вузе": "🎓", "Здоровье": "💊", "Гигиена": "🧴",
+    "Стрижка": "💇", "Одежда": "👗", "Подарки": "🎁", "Важное для любимой": "❤️", "Развлечения": "🎬",
+    "Досуг": "🎮", "Отпуск": "✈️", "Подписка": "📺", "Гаджеты и техника": "💻", "Дом": "🔧",
+    "Другое": "🏷️", "Образование": "📚", "Родителям долг за ремонт и квартиру": "🤝",
+}
+GROUP_COLOR = {
+    "Обязательные": "Серый", "Еда": "Оранжевый", "Транспорт": "Синий", "Здоровье и уход": "Бирюзовый",
+    "Семья": "Розовый", "Досуг и покупки": "Фиолетовый", "Прочее": "Зелёный",
+}
 
 
 def sec(key):
@@ -103,11 +127,16 @@ YANDEX_API = "https://cloud-api.yandex.net/v1/disk"
 
 def yandex_token():
     token = sec("yandex_token")
-    if not token:
-        github = sec("github")  # токен мог случайно оказаться внутри блока [github]
-        if isinstance(github, Mapping):
-            token = github.get("yandex_token")
-    return token
+    if token:
+        return token
+    try:  # токен мог случайно оказаться внутри какого-то блока [...] в Secrets
+        for key in st.secrets.keys():
+            sub = st.secrets[key]
+            if isinstance(sub, Mapping) and sub.get("yandex_token"):
+                return sub.get("yandex_token")
+    except Exception:
+        pass
+    return None
 
 
 def yandex_headers():
@@ -154,16 +183,18 @@ def sput(path, value):
             file.write(payload)
         return
 
-    if not st.session_state.get("yandex_backup_dir_ready"):
+    folder = path.split("/")[0] if "/" in path else None
+    ready = st.session_state.setdefault("yandex_dirs", set())
+    if folder and folder not in ready:
         mkdir = requests.put(
             YANDEX_API + "/resources",
-            params={"path": "app:/backups"},
+            params={"path": "app:/" + folder},
             headers=yandex_headers(),
             timeout=20,
         )
         if mkdir.status_code not in (201, 202, 409):
             mkdir.raise_for_status()
-        st.session_state.yandex_backup_dir_ready = True
+        ready.add(folder)
 
     response = requests.get(
         YANDEX_API + "/resources/upload",
@@ -177,19 +208,16 @@ def sput(path, value):
     upload.raise_for_status()
 
 
-def slist():
+def slist(folder="backups"):
     if LOCAL:
-        folder = os.path.join(LOCAL, "backups")
-        if not os.path.isdir(folder):
+        full = os.path.join(LOCAL, folder)
+        if not os.path.isdir(full):
             return []
-        return sorted(
-            [name for name in os.listdir(folder) if name.endswith(".json")],
-            reverse=True,
-        )
+        return sorted([name for name in os.listdir(full) if name.endswith(".json")], reverse=True)
 
     response = requests.get(
         YANDEX_API + "/resources",
-        params={"path": "app:/backups", "limit": 1000, "sort": "-name"},
+        params={"path": "app:/" + folder, "limit": 1000, "sort": "-name"},
         headers=yandex_headers(),
         timeout=20,
     )
@@ -201,6 +229,34 @@ def slist():
         for item in response.json().get("_embedded", {}).get("items", [])
         if item.get("type") == "file" and item.get("name", "").endswith(".json")
     ]
+
+
+# ========================= Логи (папка logs на Яндекс.Диске) =========================
+
+def log(event, **info):
+    """Копит события сессии. Пароли и токены в логи не попадают."""
+    entry = {"ts": dt.datetime.now().isoformat(timespec="seconds"), "e": event, **info}
+    events = st.session_state.setdefault("log_all", [])
+    events.append(entry)
+    del events[:-2000]
+    st.session_state["log_dirty"] = True
+
+
+def flush_logs():
+    """Пишет лог сессии в logs/<дата>_<id>.json. Сбой логов никогда не ломает приложение."""
+    if not st.session_state.get("log_dirty"):
+        return True
+    try:
+        sid = st.session_state.setdefault("sid", uuid.uuid4().hex[:8])
+        started = st.session_state.setdefault("sid_date", str(dt.date.today()))
+        sput(
+            f"logs/{started}_{sid}.json",
+            {"app": APP_VERSION, "sid": sid, "date": started, "events": st.session_state.get("log_all", [])},
+        )
+        st.session_state["log_dirty"] = False
+        return True
+    except Exception:
+        return False
 
 
 def uid():
@@ -233,16 +289,9 @@ def fix_ids(entries):
 
 def default_data():
     return {
-        "v": 2,
-        "rev": 0,
-        "cfg": {},
+        "v": 2, "rev": 0, "cfg": {},
         "cats": {category: group for group, categories in G0.items() for category in categories},
-        "bud": {},
-        "rec": [],
-        "exp": [],
-        "sav": [],
-        "inc": {},
-        "trash": [],
+        "bud": {}, "rec": [], "exp": [], "sav": [], "inc": {}, "trash": [], "style": {},
     }
 
 
@@ -268,13 +317,7 @@ def migrate(data):
 
     defaults = {
         "cats": {category: group for group, categories in G0.items() for category in categories},
-        "bud": {},
-        "rec": [],
-        "exp": [],
-        "sav": [],
-        "inc": {},
-        "trash": [],
-        "rev": 0,
+        "bud": {}, "rec": [], "exp": [], "sav": [], "inc": {}, "trash": [], "style": {}, "rev": 0,
     }
     for key, value in defaults.items():
         result.setdefault(key, value)
@@ -323,6 +366,7 @@ def merge(local_data, remote_data):
     out["inc"] = {**remote_data["inc"], **local_data["inc"]}
     out["cats"] = {**remote_data["cats"], **local_data["cats"]}
     out["bud"] = {**remote_data["bud"], **local_data["bud"]}
+    out["style"] = {**remote_data["style"], **local_data["style"]}
     out["rec"] = local_data["rec"]
     out["cfg"] = {**remote_data["cfg"], **local_data["cfg"]}
     out["rev"] = max(local_data.get("rev", 0), remote_data.get("rev", 0))
@@ -332,6 +376,11 @@ def merge(local_data, remote_data):
 # ========================= Первичная загрузка =========================
 
 if "D" not in st.session_state:
+    load_started = time.time()
+    st.session_state["sid"] = uuid.uuid4().hex[:8]
+    st.session_state["sid_date"] = str(dt.date.today())
+    log("session_start", app=APP_VERSION, streamlit=st.__version__, storage="local" if LOCAL else "yandex")
+
     if not (LOCAL or yandex_token()):
         try:
             found_keys = ", ".join(st.secrets.keys())
@@ -339,7 +388,7 @@ if "D" not in st.session_state:
             found_keys = "секретов нет"
         st.error(
             "Не задан доступ к Яндекс.Диску: в Secrets нет `yandex_token`. "
-            "Он должен стоять в самом верху, ДО строки `[github]`. "
+            "Он должен стоять в самом верху, ДО любой строки вида `[...]`. "
             f"Сейчас видны ключи: {found_keys or '—'}"
         )
         st.stop()
@@ -350,10 +399,11 @@ if "D" not in st.session_state:
             backup_names = slist()
             if backup_names:
                 loaded = sget("backups/" + backup_names[0])
-                st.session_state.note = (
-                    "Основной файл не найден — загружена последняя резервная копия."
-                )
+                st.session_state.note = "Основной файл не найден — загружена последняя резервная копия."
+                log("load_from_backup", name=backup_names[0])
     except Exception as error:
+        log("load_fail", error=str(error)[:300])
+        flush_logs()
         st.error(f"Не удалось прочитать хранилище: {error}. Данные не изменены.")
         if st.button("Повторить загрузку", key="retry_load"):
             st.rerun()
@@ -361,6 +411,8 @@ if "D" not in st.session_state:
 
     st.session_state.D = migrate(loaded if loaded else default_data())
     st.session_state.base = (loaded or {}).get("rev", 0)
+    log("load_ok", ms=int((time.time() - load_started) * 1000), exp=len(st.session_state.D["exp"]),
+        sav=len(st.session_state.D["sav"]), rev=st.session_state.base)
 
 
 D = st.session_state.D
@@ -371,7 +423,8 @@ if st.session_state.get("note"):
 
 
 def save():
-    """Сохраняет данные и делает резервную копию предыдущей версии."""
+    """Сохраняет данные, делает резервную копию предыдущей версии и пишет лог."""
+    started = time.time()
     try:
         remote = sget("data.json")
         current = st.session_state.D
@@ -379,6 +432,7 @@ def save():
         if remote and remote.get("rev", 0) != st.session_state.get("base", 0):
             current = merge(current, remote)
             st.session_state.D = current
+            log("merge_conflict", remote_rev=remote.get("rev"), base=st.session_state.get("base"))
             st.info("Данные изменились на другом устройстве — записи объединены.")
 
         if remote:
@@ -388,9 +442,13 @@ def save():
         current["rev"] = (remote or {}).get("rev", 0) + 1
         sput("data.json", current)
         st.session_state.base = current["rev"]
+        log("save_ok", ms=int((time.time() - started) * 1000), rev=current["rev"], exp=len(current["exp"]), sav=len(current["sav"]))
+        flush_logs()
         return True
 
     except Exception as error:
+        log("save_fail", error=str(error)[:300])
+        flush_logs()
         st.error(
             f"НЕ СОХРАНЕНО: {error}. Данные пока остались в текущей сессии. "
             "Не закрывай страницу; проверь подключение и повтори действие."
@@ -404,21 +462,26 @@ def commit():
     st.stop()
 
 
-def add(kind, **values):
+def add(kind, via="manual", **values):
     D[kind].append({"id": uid(), **values})
     D[kind].sort(key=lambda item: (str(item.get("d", "")), int(item.get("id", 0))))
+    try:
+        days_back = (dt.date.today() - dt.date.fromisoformat(str(values.get("d")))).days
+    except ValueError:
+        days_back = None
+    log("entry_add", kind=kind, type=values.get("t") or values.get("k"), cat=values.get("c"),
+        amount=values.get("a"), via=via, comment=bool(values.get("n")), days_back=days_back)
 
 
 def trash(kind, entry):
     if entry in D[kind]:
         D[kind].remove(entry)
         D["trash"].append({
-            "id": entry["id"],
-            "k": kind,
-            "e": entry,
+            "id": entry["id"], "k": kind, "e": entry,
             "ts": dt.datetime.now().isoformat(timespec="seconds"),
         })
         D["trash"] = D["trash"][-500:]
+        log("entry_delete", kind=kind, cat=entry.get("c"), amount=entry.get("a"))
 
 
 # ========================= Подготовка данных и расчёты =========================
@@ -453,6 +516,52 @@ cfg["start"] = max(0.0, safe_float(cfg.get("start"), 0))
 start_month_date = min(safe_date(cfg.get("frm"), today), today)
 cfg["frm"] = str(start_month_date)
 cfg["sdate"] = str(safe_date(cfg.get("sdate"), start_month_date))
+
+
+def apply_recurring_payments():
+    """Добавляет регулярные платежи в расходы в их день месяца (после наступления дня)."""
+    changed = False
+
+    for recurring in D["rec"]:
+        try:
+            last_text = recurring.get("last")
+            if not isinstance(last_text, str) or not re.fullmatch(r"\d{4}-\d{2}", last_text):
+                year, month = month_before(today.year, today.month)
+            else:
+                year, month = map(int, last_text.split("-"))
+
+            day_number = min(31, max(1, int(recurring["day"])))
+            amount = float(recurring["a"])
+            if amount <= 0:
+                continue
+
+            while (year, month) < (today.year, today.month):
+                year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+                payment_date = dt.date(year, month, min(day_number, calendar.monthrange(year, month)[1]))
+                if payment_date > today:
+                    break
+
+                note = ("авто " + str(recurring.get("n", ""))).strip()
+                duplicate = any(
+                    entry.get("t", "e") == "e" and entry.get("n", "") == note
+                    and entry.get("c") == recurring["c"] and entry.get("d") == str(payment_date)
+                    and abs(safe_float(entry.get("a")) - amount) < 0.001
+                    for entry in D["exp"]
+                )
+                if not duplicate:
+                    add("exp", via="recurring", d=str(payment_date), c=recurring["c"], a=amount, n=note, t="e")
+
+                recurring["last"] = f"{year}-{month:02d}"
+                changed = True
+
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if changed:
+        commit()
+
+
+apply_recurring_payments()
 
 
 def make_frame(rows, columns):
@@ -506,15 +615,9 @@ for month in month_range(start_month_date, today):
     amount_to_save = max(0.0, planned_saving - saved_percent)
 
     monthly[month] = {
-        "base": base_income,
-        "ex": extra_income,
-        "inc": income_total,
-        "pl": planned_saving,
-        "sp": expenses,
-        "p25": saved_percent,
-        "need": amount_to_save,
-        "rest": cash - amount_to_save,
-        "cin": carry,
+        "base": base_income, "ex": extra_income, "inc": income_total, "pl": planned_saving,
+        "sp": expenses, "p25": saved_percent, "need": amount_to_save,
+        "rest": cash - amount_to_save, "cin": carry,
     }
     carry = cash
 
@@ -526,12 +629,26 @@ mc = monthly.get(current_month, {
 })
 
 
+def pending_mandatory():
+    """Обязательные (регулярные) платежи этого месяца, которые ещё не списаны."""
+    items = []
+    for recurring in D["rec"]:
+        try:
+            if str(recurring.get("last")) != current_month and float(recurring["a"]) > 0:
+                items.append(recurring)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return items
+
+
+pending = pending_mandatory()
+reserve = sum(safe_float(item.get("a")) for item in pending)
+rest_net = mc["rest"] - reserve     # реальный остаток: уже вычтены обязательные платежи месяца
+
+
 def savings_engine(until):
     flows = [(safe_date(cfg["sdate"], today), cfg["start"])]
-    flows += [
-        (row.d, -float(row.a) if row.k == "wd" else float(row.a))
-        for row in S.itertuples()
-    ]
+    flows += [(row.d, -float(row.a) if row.k == "wd" else float(row.a)) for row in S.itertuples()]
     flows += [(row.d, float(row.a)) for row in C.itertuples()]
     flows = sorted((date, amount) for date, amount in flows if date <= until)
 
@@ -584,10 +701,7 @@ def motivation_messages():
     messages = []
     today_spend = sum_between(E, today, today)
     if today_spend > daily_limit:
-        messages.append((
-            "warning",
-            f"Сегодня потрачено на {money(today_spend - daily_limit)} больше дневного ориентира.",
-        ))
+        messages.append(("warning", f"Сегодня потрачено на {money(today_spend - daily_limit)} больше дневного ориентира."))
     elif today_spend > 0:
         messages.append(("info", f"Сегодня в рамках дневного ориентира. Запас {money(daily_limit - today_spend)}."))
     else:
@@ -606,925 +720,862 @@ def motivation_messages():
         else:
             messages.append(("info", f"За неделю потрачено на {money(-difference)} меньше. Хорошая динамика!"))
 
-    current_categories = (
-        E.loc[(E["d"] >= week_start) & (E["g"] != "Обязательные")]
-        .groupby("c")["a"].sum()
-    )
+    current_categories = E.loc[(E["d"] >= week_start) & (E["g"] != "Обязательные")].groupby("c")["a"].sum()
     previous_categories = E.loc[
         (E["d"] >= previous_week_start) & (E["d"] <= previous_week_start + dt.timedelta(days=elapsed))
     ].groupby("c")["a"].sum()
     difference_by_category = current_categories.sub(previous_categories, fill_value=0)
 
     if not difference_by_category.empty and difference_by_category.max() > 500:
-        category = difference_by_category.idxmax()
-        messages.append(("warning", f"Сильнее всего выросла категория «{category}»: +{money(difference_by_category.max())}."))
+        messages.append(("warning", f"Сильнее всего выросла категория «{difference_by_category.idxmax()}»: +{money(difference_by_category.max())}."))
 
     return messages
 
 
-# ========================= Интерфейс =========================
+# ========================= Иконки и цвета категорий =========================
 
-st.markdown("### 💰 Путь к миллиону")
-tab_home, tab_add, tab_analytics, tab_savings, tab_history, tab_groups, tab_more = st.tabs([
-    "🏠 Главная", "➕ Внести", "📊 Аналитика", "💰 Накопления",
-    "📜 История", "🗂 Группы", "⚙️ Ещё",
-])
+def style_of(category):
+    """(иконка, цвет в hex, название цвета) категории."""
+    custom = D["style"].get(category, {}) if isinstance(D.get("style"), dict) else {}
+    group = D["cats"].get(category, "Прочее")
+    icon = custom.get("i") or DEFAULT_ICON.get(category) or "🏷️"
+    color_name = custom.get("c") if custom.get("c") in COLORS else None
+    color_name = color_name or GROUP_COLOR.get(group) or list(COLORS)[sum(map(ord, group)) % len(COLORS)]
+    return icon, COLORS[color_name], color_name
 
 
-# ========================= Главная =========================
+def tile_css(items, selected=None):
+    """CSS для плиток-кнопок: items = [(key, category)]. Выбранная плитка — залитая цветом."""
+    rules = []
+    for key, category in items:
+        _, color, _ = style_of(category)
+        if category == selected:
+            rules.append(f".st-key-{key} button{{background:{color}!important;color:#fff!important;border:2px solid {color}!important;border-radius:14px!important}}")
+        else:
+            rules.append(f".st-key-{key} button{{background:{color}22!important;border:1px solid {color}!important;border-radius:14px!important}}")
+    return "<style>" + "".join(rules) + "</style>" if rules else ""
 
-with tab_home:
-    st.metric(
-        "Накоплено (расчётная сумма)",
-        money(balance),
-        f"{balance / cfg['goal'] * 100:.1f}% от {money(cfg['goal'])}",
-        delta_color="off",
-    )
-    st.progress(max(0.0, min(1.0, balance / cfg["goal"])))
 
-    caption = (
-        f"Вложено {money(principal)} · проценты {money(interest)} · "
-        f"ставка {cfg['srate']:g}% · ещё примерно {money(year_interest)} за год"
-    )
-    if balance >= cfg["goal"]:
-        st.success("🎉 Цель достигнута!")
-    elif months_to_goal >= 240 or (monthly_addition <= 0 and daily_rate == 0):
-        caption += " · при текущем темпе цель не достигается"
-    else:
-        estimated_date = today + dt.timedelta(days=int(months_to_goal * 30.4))
-        caption += f" · ориентир достижения цели: {months_to_goal} мес. ({estimated_date:%m.%Y})"
-    st.caption(caption)
+def quick_expenses(limit=6):
+    """Разные (по категориям) самые частые траты с их типичной суммой."""
+    recent = E[E["d"] >= today - dt.timedelta(days=90)]
+    source = recent if len(recent) >= 5 else E
+    rows = []
+    for category, group in source.groupby("c"):
+        if category not in D["cats"]:
+            continue
+        rounded = group.assign(r=group["a"].round(2))
+        stats = rounded.groupby("r").agg(n=("a", "size"), last=("d", "max")).sort_values(["n", "last"], ascending=False)
+        rows.append((len(group), group["d"].max(), category, float(stats.index[0])))
+    rows.sort(reverse=True)
+    return [(category, amount) for _, _, category, amount in rows[:limit]]
 
-    st.markdown(
-        f"**{month_label(current_month)}** · доход {money(mc['inc'])} · "
-        f"потрачено {money(mc['sp'])} из лимита {money(cfg['cap'])}"
-    )
 
-    col_save, col_rest = st.columns(2)
-    col_save.metric(
-        f"Отложить {cfg['pct']:g}% дохода",
-        money(mc["need"]),
-        "уже отложено" if mc["need"] == 0 else f"план {money(mc['pl'])}",
-        delta_color="off",
-    )
-    if mc["need"] > 0 and col_save.button("Отложить в накопления", key="save_percent"):
-        add("sav", d=str(today), a=round(mc["need"], 2), k="p25", n=f"{cfg['pct']:g}% за {month_label(current_month)}")
-        commit()
+def run_ui():
+    # ========================= Интерфейс =========================
 
-    col_rest.metric(
-        "Остаток после трат",
-        money(mc["rest"]),
-        f"перенос с прошлого месяца {money(mc['cin'])}" if mc["cin"] else None,
-        delta_color="off",
-    )
-    if mc["rest"] > 0 and col_rest.button("Положить остаток", key="save_rest"):
-        add("sav", d=str(today), a=round(mc["rest"], 2), k="rest", n=f"остаток {month_label(current_month)}")
-        commit()
+    P_HOME, P_ADD, P_AN, P_SAV = "🏠 Главная", "➕ Внести", "📊 Аналитика", "💰 Накопления"
+    P_HIS, P_GRP, P_MORE = "📜 История", "🗂 Группы", "⚙️ Ещё"
+    PAGES = [P_HOME, P_ADD, P_AN, P_SAV, P_HIS, P_GRP, P_MORE]
 
-    days_left = calendar.monthrange(today.year, today.month)[1] - today.day
-    if days_left < 3 and mc["rest"] > 0:
-        st.info("Конец месяца — можно положить остаток в накопления. Если не откладывать, он перейдёт на следующий месяц.")
+    st.markdown("### 💰 Путь к миллиону")
+    page = st.pills("Раздел", PAGES, default=P_HOME, required=True, key="nav", label_visibility="collapsed")
+    page = page or P_HOME
+    if st.session_state.get("prev_page") != page:
+        log("nav", page=page)
+        st.session_state["prev_page"] = page
 
-    today_spend = sum_between(E, today, today)
-    st.metric(
-        "Сегодня потрачено",
-        money(today_spend),
-        f"{today_spend - daily_limit:+,.0f} ₽ к дневному ориентиру".replace(",", " "),
-        delta_color="inverse",
-    )
+    cat_ids = {category: index for index, category in enumerate(sorted(D["cats"]))}
 
-    for message_type, message in motivation_messages():
-        (st.warning if message_type == "warning" else st.info)(message)
 
-    if D["bud"]:
-        group_spending = E[E["m"] == current_month].groupby("g")["a"].sum()
-        for group, limit in D["bud"].items():
-            limit = safe_float(limit)
-            if limit > 0:
-                used = float(group_spending.get(group, 0))
-                st.progress(
-                    min(1.0, used / limit),
-                    text=f"{group}: {money(used)} из {money(limit)}" + (" ⚠️" if used > limit else ""),
-                )
+    # ========================= Главная =========================
 
-    st.markdown("**Последние записи**")
-    for entry in D["exp"][-6:][::-1]:
-        left, right = st.columns([6, 1])
-        label = "🎁 Кешбек" if entry.get("t") == "cb" else entry.get("c", "Запись")
-        sign = "+" if entry.get("t") in ("cb", "in") else ""
-        left.write(
-            f"{str(entry.get('d', ''))[5:]} · {label} · "
-            f"**{sign}{money(entry.get('a', 0))}** {entry.get('n', '')}"
+    if page == P_HOME:
+        st.metric(
+            "Накоплено (реально отложено)",
+            money(balance),
+            f"{balance / cfg['goal'] * 100:.1f}% от {money(cfg['goal'])}",
+            delta_color="off",
         )
-        if right.button("✕", key=f"delete_exp_{entry['id']}"):
-            trash("exp", entry)
+        st.progress(max(0.0, min(1.0, balance / cfg["goal"])))
+
+        caption = (
+            f"Вложено {money(principal)} · проценты {money(interest)} · "
+            f"ставка {cfg['srate']:g}% · ещё примерно {money(year_interest)} за год"
+        )
+        if balance >= cfg["goal"]:
+            st.success("🎉 Цель достигнута!")
+        elif months_to_goal >= 240 or (monthly_addition <= 0 and daily_rate == 0):
+            caption += " · при текущем темпе цель не достигается"
+        else:
+            estimated_date = today + dt.timedelta(days=int(months_to_goal * 30.4))
+            caption += f" · ориентир достижения цели: {months_to_goal} мес. ({estimated_date:%m.%Y})"
+        st.caption(caption)
+
+        st.markdown(
+            f"**{month_label(current_month)}** · доход {money(mc['inc'])} · "
+            f"потрачено {money(mc['sp'])} из лимита {money(cfg['cap'])}"
+        )
+
+        col_save, col_rest = st.columns(2)
+        col_save.metric(
+            f"Отложить {cfg['pct']:g}% дохода",
+            money(mc["need"]),
+            "уже отложено" if mc["need"] == 0 else f"план {money(mc['pl'])}",
+            delta_color="off",
+        )
+        if mc["need"] > 0 and col_save.button("Отложить в накопления", key="save_percent"):
+            add("sav", via="home", d=str(today), a=round(mc["need"], 2), k="p25", n=f"{cfg['pct']:g}% за {month_label(current_month)}")
             commit()
 
+        if reserve:
+            rest_note = f"с учётом обязательных −{money(reserve)}"
+        elif mc["cin"]:
+            rest_note = f"перенос с прошлого месяца {money(mc['cin'])}"
+        else:
+            rest_note = None
+        col_rest.metric("Остаток после трат", money(rest_net), rest_note, delta_color="off")
+        if rest_net > 0 and col_rest.button("Положить остаток", key="save_rest"):
+            add("sav", via="home", d=str(today), a=round(rest_net, 2), k="rest", n=f"остаток {month_label(current_month)}")
+            commit()
 
-# ========================= Внести =========================
+        days_left = calendar.monthrange(today.year, today.month)[1] - today.day
+        if rest_net > 0:
+            st.caption(f"≈ {money(rest_net / (days_left + 1))} в день до конца месяца — столько реально можно потратить.")
+        elif rest_net < 0:
+            st.warning(f"Не хватает {money(-rest_net)}: с учётом обязательных платежей этого месяца ты уходишь в минус.")
 
-with tab_add:
-    entry_kind = st.radio(
-        "Что вносим",
-        ["Трата", "Кешбек", "Доп. доход", "Доход месяца", "В накопления", "Из накоплений"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="entry_kind",
-    )
+        if pending:
+            with st.expander(f"Обязательные платежи впереди: {money(reserve)} (уже вычтены из остатка)"):
+                for item in pending:
+                    icon, _, _ = style_of(item.get("c"))
+                    st.write(f"{icon} {item.get('c')} — {money(item.get('a'))} (до {int(item.get('day', 1))}-го числа)")
+                st.caption("Список меняется в разделе «Группы» → «Регулярные платежи».")
+        else:
+            st.caption("Добавь ипотеку, связь и подписки в «Группы» → «Регулярные платежи» — они будут вычитаться из остатка с 1-го числа.")
 
-    categories_order = sorted(
-        D["cats"],
-        key=lambda category: (
-            list(dict.fromkeys(D["cats"].values())).index(D["cats"][category]),
-            category,
-        ),
-    )
+        if days_left < 3 and rest_net > 0:
+            st.info("Конец месяца — можно положить остаток в накопления. Если не откладывать, он перейдёт на следующий месяц.")
 
-    if entry_kind == "Трата":
-        frequent = (
-            E[E["d"] >= today - dt.timedelta(days=90)]
-            .groupby(["c", "a"]).size().reset_index(name="k")
-            .query("k >= 2").sort_values("k", ascending=False).head(6)
+        today_spend = sum_between(E, today, today)
+        st.metric(
+            "Сегодня потрачено",
+            money(today_spend),
+            f"{today_spend - daily_limit:+,.0f} ₽ к дневному ориентиру".replace(",", " "),
+            delta_color="inverse",
         )
-        if not frequent.empty:
-            quick_columns = st.columns(3)
-            for index, row in enumerate(frequent.itertuples(index=False)):
-                if quick_columns[index % 3].button(
-                    f"{row.c} · {row.a:.0f}",
-                    key=f"quick_expense_{index}",
-                ):
-                    add("exp", d=str(today), c=row.c, a=float(row.a), n="", t="e")
-                    commit()
 
-    if entry_kind in ("Трата", "Кешбек", "Доп. доход", "В накопления", "Из накоплений"):
-        with st.form("add_entry_form", clear_on_submit=True):
-            amount = st.number_input("Сумма, ₽", min_value=0.0, step=100.0, key="add_amount")
-            entry_date = st.date_input("Дата", today, key="add_date")
+        for message_type, message in motivation_messages():
+            (st.warning if message_type == "warning" else st.info)(message)
 
-            category = None
-            if entry_kind == "Трата":
-                if not categories_order:
-                    st.warning("Сначала добавь хотя бы одну категорию во вкладке «Группы».")
-                else:
-                    category = st.selectbox(
-                        "Категория",
-                        categories_order,
-                        format_func=lambda value: f"{D['cats'][value]} · {value}",
-                        key="add_category",
+        if D["bud"]:
+            group_spending = E[E["m"] == current_month].groupby("g")["a"].sum()
+            for group, limit in D["bud"].items():
+                limit = safe_float(limit)
+                if limit > 0:
+                    used = float(group_spending.get(group, 0))
+                    st.progress(
+                        min(1.0, used / limit),
+                        text=f"{group}: {money(used)} из {money(limit)}" + (" ⚠️" if used > limit else ""),
                     )
 
-            comment_label = "Источник (подработка, возврат…)" if entry_kind == "Доп. доход" else "Комментарий"
-            comment = st.text_input(comment_label, key="add_comment")
+        st.markdown("**Последние записи**")
+        for entry in D["exp"][-6:][::-1]:
+            left, right = st.columns([6, 1])
+            if entry.get("t") == "cb":
+                label = "🎁 Кешбек"
+            else:
+                label = f"{style_of(entry.get('c'))[0]} {entry.get('c', 'Запись')}"
+            sign = "+" if entry.get("t") in ("cb", "in") else ""
+            left.write(f"{str(entry.get('d', ''))[5:]} · {label} · **{sign}{money(entry.get('a', 0))}** {entry.get('n', '')}")
+            if right.button("✕", key=f"delete_exp_{entry['id']}"):
+                trash("exp", entry)
+                commit()
 
-            submitted = st.form_submit_button("Добавить", type="primary")
-            if submitted:
-                if amount <= 0:
-                    st.error("Сумма должна быть больше нуля.")
-                elif entry_kind == "Трата":
-                    if category is None:
-                        st.error("Нет доступных категорий.")
+
+    # ========================= Внести =========================
+
+    if page == P_ADD:
+        entry_kind = st.radio(
+            "Что вносим",
+            ["Трата", "Кешбек", "Доп. доход", "Доход месяца", "В накопления", "Из накоплений"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="entry_kind",
+        )
+
+        if entry_kind == "Трата":
+            recent = E[E["d"] >= today - dt.timedelta(days=90)]
+            frequency = recent["c"].value_counts().to_dict()
+            ranked = sorted(D["cats"], key=lambda category: (-frequency.get(category, 0), category))
+            picked = st.session_state.get("pick_cat")
+            if picked not in D["cats"]:
+                picked = ranked[0] if ranked else None
+            tile_items = []
+
+            quick = quick_expenses(6)
+            if quick:
+                st.caption("⚡ Быстро — одним нажатием (разные траты, самые частые)")
+                with st.container(horizontal=True):
+                    for index, (category, amount) in enumerate(quick):
+                        key = f"quick_{index}"
+                        tile_items.append((key, category))
+                        if st.button(f"{style_of(category)[0]} {category} · {amount:,.0f}".replace(",", " "), key=key):
+                            add("exp", via="quick", d=str(today), c=category, a=float(amount), n="", t="e")
+                            commit()
+
+            st.caption("Категория — сверху те, которыми пользуешься чаще")
+            with st.container(horizontal=True):
+                for category in ranked[:8]:
+                    key = f"cat_{cat_ids[category]}"
+                    tile_items.append((key, category))
+                    if st.button(f"{style_of(category)[0]} {category}", key=key):
+                        st.session_state["pick_cat"] = picked = category
+
+            others = ranked[8:]
+            if others:
+                with st.expander(f"Все остальные категории ({len(others)})"):
+                    for group in dict.fromkeys(D["cats"][category] for category in others):
+                        st.caption(group)
+                        with st.container(horizontal=True):
+                            for category in [c for c in others if D["cats"][c] == group]:
+                                key = f"cat_{cat_ids[category]}"
+                                tile_items.append((key, category))
+                                if st.button(f"{style_of(category)[0]} {category}", key=key):
+                                    st.session_state["pick_cat"] = picked = category
+
+            quick_keys = {item for item in tile_items if item[0].startswith("quick_")}
+            st.html(tile_css([item for item in tile_items if item not in quick_keys], picked) + tile_css(sorted(quick_keys)))
+
+        if entry_kind in ("Трата", "Кешбек", "Доп. доход", "В накопления", "Из накоплений"):
+            with st.form("add_entry_form", clear_on_submit=True):
+                if entry_kind == "Трата":
+                    if picked:
+                        st.markdown(f"Категория: **{style_of(picked)[0]} {picked}** · {D['cats'][picked]}")
                     else:
-                        add("exp", d=str(entry_date), c=category, a=float(amount), n=comment, t="e")
+                        st.warning("Сначала добавь хотя бы одну категорию в разделе «Группы».")
+                amount = st.number_input("Сумма, ₽", min_value=0.0, step=100.0, key="add_amount")
+                entry_date = st.date_input("Дата", today, key="add_date")
+                comment_label = "Источник (подработка, возврат…)" if entry_kind == "Доп. доход" else "Комментарий"
+                comment = st.text_input(comment_label, key="add_comment")
+
+                if st.form_submit_button("Добавить", type="primary"):
+                    if amount <= 0:
+                        log("validation_error", where="add_form", kind=entry_kind)
+                        st.error("Сумма должна быть больше нуля.")
+                    elif entry_kind == "Трата":
+                        if not picked:
+                            st.error("Нет доступных категорий.")
+                        else:
+                            add("exp", via="form", d=str(entry_date), c=picked, a=float(amount), n=comment, t="e")
+                            commit()
+                    elif entry_kind == "Кешбек":
+                        add("exp", via="form", d=str(entry_date), c="Кешбек", a=float(amount), n=comment, t="cb")
                         commit()
-                elif entry_kind == "Кешбек":
-                    add("exp", d=str(entry_date), c="Кешбек", a=float(amount), n=comment, t="cb")
-                    commit()
-                elif entry_kind == "Доп. доход":
-                    add("exp", d=str(entry_date), c="Доп. доход", a=float(amount), n=comment, t="in")
-                    commit()
-                else:
-                    operation = "dep" if entry_kind == "В накопления" else "wd"
-                    add("sav", d=str(entry_date), a=float(amount), k=operation, n=comment)
-                    commit()
+                    elif entry_kind == "Доп. доход":
+                        add("exp", via="form", d=str(entry_date), c="Доп. доход", a=float(amount), n=comment, t="in")
+                        commit()
+                    else:
+                        add("sav", via="form", d=str(entry_date), a=float(amount), k="dep" if entry_kind == "В накопления" else "wd", n=comment)
+                        commit()
 
-        if entry_kind == "Кешбек":
-            st.caption("Кешбек учитывается как поступление в накопления.")
-        elif entry_kind == "Из накоплений":
-            st.caption("Снятие уменьшает накопления и увеличивает свободные деньги месяца.")
+            if entry_kind == "Кешбек":
+                st.caption("Кешбек учитывается как поступление в накопления.")
+            elif entry_kind == "Из накоплений":
+                st.caption("Снятие уменьшает накопления и увеличивает свободные деньги месяца.")
 
-    if entry_kind == "Доход месяца":
-        next_year, next_month = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
-        months = sorted(
-            set(list(monthly) + list(D["inc"]) + [f"{next_year}-{next_month:02d}"]),
-            reverse=True,
-        )
-        selected_month = st.selectbox("Месяц дохода", months, format_func=month_label, key="income_month_select")
-        income_key = "income_value_" + selected_month
-        income_value = st.number_input(
-            "Основной доход за этот месяц, ₽",
-            min_value=0.0,
-            value=float(D["inc"].get(selected_month, cfg["income"])),
-            step=1000.0,
-            key=income_key,
-        )
-        save_col, reset_col = st.columns(2)
-        if save_col.button("Сохранить доход месяца", type="primary", key="save_month_income"):
-            D["inc"][selected_month] = float(income_value)
-            commit()
-        if selected_month in D["inc"] and reset_col.button("Сбросить к стандартному", key="reset_month_income"):
-            del D["inc"][selected_month]
-            st.session_state.pop(income_key, None)
-            commit()
-        st.caption(f"Стандартный доход: {money(cfg['income'])}. Дополнительные доходы вносятся отдельно и прибавляются.")
-
-
-# ========================= Аналитика =========================
-
-with tab_analytics:
-    available_months = sorted(set(E["m"].tolist()) | {current_month}, reverse=True)
-    selected = st.selectbox(
-        "Месяц анализа", available_months, format_func=month_label,
-        label_visibility="collapsed", key="analytics_month",
-    )
-
-    year, month_number = map(int, selected.split("-"))
-    days_in_month = calendar.monthrange(year, month_number)[1]
-    month_start = dt.date(year, month_number, 1)
-    month_end = min(dt.date(year, month_number, days_in_month), today)
-    elapsed_days = max(1, (month_end - month_start).days + 1)
-
-    previous_month = (month_start - one_day).strftime("%Y-%m")
-    current_expenses = E[E["m"] == selected]
-    previous_expenses = E[E["m"] == previous_month]
-    spent = float(current_expenses["a"].sum())
-    previous_spent = float(previous_expenses["a"].sum())
-
-    month_income = (
-        monthly[selected]["inc"]
-        if selected in monthly
-        else safe_float(D["inc"].get(selected, cfg["income"]), cfg["income"])
-        + float(I.loc[I["m"] == selected, "a"].sum())
-    )
-    projection = spent / elapsed_days * days_in_month if selected == current_month else spent
-
-    metric_a, metric_b = st.columns(2)
-    metric_a.metric("Потрачено", money(spent), f"{spent - previous_spent:+,.0f} ₽ к {month_label(previous_month)}".replace(",", " "), delta_color="inverse")
-    metric_b.metric("В день", money(spent / elapsed_days))
-
-    metric_c, metric_d = st.columns(2)
-    metric_c.metric("Прогноз месяца" if selected == current_month else "Итог месяца", money(projection), f"{projection - cfg['cap']:+,.0f} ₽ к лимиту".replace(",", " "), delta_color="inverse")
-    metric_d.metric("Доля дохода", f"{spent / month_income * 100:.0f}%" if month_income else "—", f"доход {money(month_income)}", delta_color="off")
-
-    daily_data = pd.DataFrame({"День": range(1, days_in_month + 1)})
-    daily_data["Траты"] = [
-        float(current_expenses.loc[current_expenses["d"] == dt.date(year, month_number, day_number), "a"].sum())
-        for day_number in daily_data["День"]
-    ]
-    daily_data["Накопительно"] = daily_data["Траты"].cumsum()
-    daily_data["Лимит"] = [cfg["cap"] / days_in_month * day_number for day_number in daily_data["День"]]
-
-    if selected == current_month:
-        daily_data.loc[daily_data["День"] > today.day, "Накопительно"] = None
-
-    st.caption("Траты по дням (красный — выше дневного лимита)")
-    st.altair_chart(
-        alt.Chart(daily_data)
-        .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-        .encode(
-            x=alt.X("День:O", axis=alt.Axis(labelAngle=0, values=list(range(1, days_in_month + 1, 3)))),
-            y=alt.Y("Траты:Q", title=None),
-            color=alt.condition(
-                alt.datum["Траты"] > (cfg["cap"] / days_in_month if days_in_month else 0),
-                alt.value(RED), alt.value(GREEN),
-            ),
-            tooltip=["День", "Траты"],
-        )
-        .properties(height=170),
-        width="stretch",
-    )
-
-    st.caption("Нарастающим итогом против плана по лимиту")
-    line_data = daily_data.melt("День", ["Накопительно", "Лимит"], "Показатель", "Значение")
-    st.altair_chart(
-        alt.Chart(line_data)
-        .mark_line(strokeWidth=3)
-        .encode(
-            x=alt.X("День:Q", title=None),
-            y=alt.Y("Значение:Q", title=None),
-            color=alt.Color(
-                "Показатель:N",
-                scale=alt.Scale(domain=["Накопительно", "Лимит"], range=[BLUE, "#9ca3af"]),
-                title=None,
-            ),
-            strokeDash=alt.condition(alt.datum["Показатель"] == "Лимит", alt.value([5, 4]), alt.value([0])),
-            tooltip=["День", "Показатель", "Значение"],
-        )
-        .properties(height=170),
-        width="stretch",
-    )
-
-    group_pie = current_expenses.groupby("g")["a"].sum().reset_index()
-    if not group_pie.empty:
-        st.caption("Структура расходов по группам")
-        st.altair_chart(
-            alt.Chart(group_pie)
-            .mark_arc(innerRadius=60)
-            .encode(theta="a:Q", color=alt.Color("g:N", title=None, scale=alt.Scale(scheme="tableau10")), tooltip=["g", "a"])
-            .properties(height=220),
-            width="stretch",
-        )
-
-        category_compare = (
-            pd.concat([
-                current_expenses.groupby("c")["a"].sum().rename("Этот месяц"),
-                previous_expenses.groupby("c")["a"].sum().rename("Прошлый"),
-            ], axis=1)
-            .fillna(0).sort_values("Этот месяц", ascending=False).head(10)
-            .rename_axis("c").reset_index()
-        )
-        st.caption("Топ-10 категорий: этот и прошлый месяц")
-        st.altair_chart(
-            alt.Chart(category_compare.melt("c", ["Этот месяц", "Прошлый"], "Период", "Сумма"))
-            .mark_bar()
-            .encode(
-                y=alt.Y("c:N", sort=list(category_compare["c"]), title=None),
-                x=alt.X("Сумма:Q", title=None),
-                yOffset="Период:N",
-                color=alt.Color("Период:N", scale=alt.Scale(domain=["Этот месяц", "Прошлый"], range=[GREEN, "#cbd5e1"]), title=None),
-                tooltip=["c", "Период", "Сумма"],
+        if entry_kind == "Доход месяца":
+            next_year, next_month = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+            months = sorted(set(list(monthly) + list(D["inc"]) + [f"{next_year}-{next_month:02d}"]), reverse=True)
+            selected_month = st.selectbox("Месяц дохода", months, format_func=month_label, key="income_month_select")
+            income_key = "income_value_" + selected_month
+            income_value = st.number_input(
+                "Основной доход за этот месяц, ₽", min_value=0.0,
+                value=float(D["inc"].get(selected_month, cfg["income"])), step=1000.0, key=income_key,
             )
-            .properties(height=max(200, 34 * len(category_compare))),
-            width="stretch",
-        )
+            save_col, reset_col = st.columns(2)
+            if save_col.button("Сохранить доход месяца", type="primary", key="save_month_income"):
+                D["inc"][selected_month] = float(income_value)
+                log("income_month_set", month=selected_month, amount=float(income_value))
+                commit()
+            if selected_month in D["inc"] and reset_col.button("Сбросить к стандартному", key="reset_month_income"):
+                del D["inc"][selected_month]
+                st.session_state.pop(income_key, None)
+                log("income_month_reset", month=selected_month)
+                commit()
+            st.caption(f"Стандартный доход: {money(cfg['income'])}. Дополнительные доходы вносятся отдельно и прибавляются.")
 
-        st.caption("Крупнейшие траты месяца")
-        st.dataframe(
-            current_expenses.nlargest(10, "a")[["d", "c", "a", "n"]].rename(
-                columns={"d": "Дата", "c": "Категория", "a": "Сумма", "n": "Комментарий"}
-            ),
-            hide_index=True,
-            width="stretch",
-        )
 
-    monthly_rows = []
-    months_for_table = sorted(set(F["m"].tolist()) | set(monthly))[-12:]
-    for month in months_for_table:
-        month_spent = float(E.loc[E["m"] == month, "a"].sum())
-        month_income_value = (
-            monthly[month]["inc"] if month in monthly
-            else safe_float(D["inc"].get(month, cfg["income"]), cfg["income"])
-            + float(I.loc[I["m"] == month, "a"].sum())
+    # ========================= Аналитика =========================
+
+    if page == P_AN:
+        available_months = sorted(set(E["m"].tolist()) | {current_month}, reverse=True)
+        selected = st.selectbox("Месяц анализа", available_months, format_func=month_label, label_visibility="collapsed", key="analytics_month")
+
+        year, month_number = map(int, selected.split("-"))
+        days_in_month = calendar.monthrange(year, month_number)[1]
+        month_start = dt.date(year, month_number, 1)
+        month_end = min(dt.date(year, month_number, days_in_month), today)
+        elapsed_days = max(1, (month_end - month_start).days + 1)
+
+        prev_end = month_start - one_day
+        prev_start = prev_end.replace(day=1)
+        prev_cut = min(prev_start + dt.timedelta(days=elapsed_days - 1), prev_end)
+        previous_month = prev_start.strftime("%Y-%m")
+
+        current_expenses = E[E["m"] == selected]
+        previous_expenses = E[E["m"] == previous_month]
+        previous_same = E[(E["d"] >= prev_start) & (E["d"] <= prev_cut)]
+
+        spent = float(current_expenses["a"].sum())
+        previous_same_total = float(previous_same["a"].sum())
+        mandatory = float(current_expenses.loc[current_expenses["g"] == "Обязательные", "a"].sum())
+        flexible = spent - mandatory
+        month_income = (
+            monthly[selected]["inc"] if selected in monthly
+            else safe_float(D["inc"].get(selected, cfg["income"]), cfg["income"]) + float(I.loc[I["m"] == selected, "a"].sum())
         )
         saved = (
-            float(S.loc[(S["m"] == month) & (S["k"] != "wd"), "a"].sum())
-            + float(C.loc[C["m"] == month, "a"].sum())
-            - float(S.loc[(S["m"] == month) & (S["k"] == "wd"), "a"].sum())
+            float(S.loc[(S["m"] == selected) & (S["k"] != "wd"), "a"].sum())
+            + float(C.loc[C["m"] == selected, "a"].sum())
+            - float(S.loc[(S["m"] == selected) & (S["k"] == "wd"), "a"].sum())
         )
-        monthly_rows.append({
-            "Месяц": month_label(month),
-            "Доход": month_income_value,
-            "Траты": month_spent,
-            "Отложено": saved,
-            "% отложено": round(saved / month_income_value * 100) if month_income_value else 0,
-        })
+        save_rate = saved / month_income * 100 if month_income else 0.0
+        pace_plan = cfg["cap"] * elapsed_days / days_in_month
+        projection = spent / elapsed_days * days_in_month if selected == current_month else spent
 
-    monthly_table = pd.DataFrame(monthly_rows)
-    st.caption("Динамика по месяцам")
-    if not monthly_table.empty:
-        st.altair_chart(
-            alt.Chart(monthly_table.melt("Месяц", ["Доход", "Траты", "Отложено"], "Тип", "Сумма"))
-            .mark_bar()
-            .encode(
-                x=alt.X("Месяц:N", sort=list(monthly_table["Месяц"]), title=None),
-                y=alt.Y("Сумма:Q", title=None),
-                xOffset="Тип:N",
-                color=alt.Color("Тип:N", scale=alt.Scale(domain=["Доход", "Траты", "Отложено"], range=[BLUE, RED, GREEN]), title=None),
-                tooltip=["Месяц", "Тип", "Сумма"],
+        kpi1, kpi2 = st.columns(2)
+        kpi1.metric("Потрачено", money(spent), f"{spent - previous_same_total:+,.0f} ₽ к {month_label(previous_month)} за те же дни".replace(",", " "), delta_color="inverse")
+        kpi2.metric("Темп к лимиту", f"{spent / pace_plan * 100:.0f}%" if pace_plan else "—", f"{spent - pace_plan:+,.0f} ₽ к плану на сегодня".replace(",", " "), delta_color="inverse")
+        kpi3, kpi4 = st.columns(2)
+        kpi3.metric("Прогноз месяца" if selected == current_month else "Итог месяца", money(projection), f"{projection - cfg['cap']:+,.0f} ₽ к лимиту {money(cfg['cap'])}".replace(",", " "), delta_color="inverse")
+        kpi4.metric("Отложено", money(saved), f"{save_rate:.0f}% дохода · цель {cfg['pct']:g}%", delta_color="off")
+
+        with st.expander("Как читать эти цифры"):
+            st.markdown(
+                "- **Потрачено** — траты месяца и разница с прошлым месяцем *за то же число дней* (так сравнение честное).\n"
+                "- **Темп к лимиту** — 100% значит, что ты идёшь ровно по лимиту; меньше — экономишь, больше — перерасход к этому дню.\n"
+                "- **Прогноз месяца** — во сколько обойдётся месяц, если и дальше тратить в том же темпе.\n"
+                "- **Отложено** — сколько реально ушло в накопления (с кешбеком) и какую долю дохода это составляет против цели."
             )
-            .properties(height=220),
-            width="stretch",
-        )
-        st.dataframe(monthly_table.iloc[::-1].round(0), hide_index=True, width="stretch")
 
-
-# ========================= Накопления =========================
-
-with tab_savings:
-    st.metric("Накоплено", money(balance), f"проценты {money(interest)}", delta_color="off")
-    savings_col1, savings_col2 = st.columns(2)
-    savings_col1.metric("Вложено своих", money(principal))
-    savings_col2.metric("Доход за год при текущей сумме", money(year_interest), f"≈ {money(year_interest / 12)} в месяц", delta_color="off")
-
-    with st.expander("Ставка и стартовая сумма", expanded=False):
-        with st.form("savings_settings_form"):
-            new_rate = st.number_input("Ставка по накоплениям, % годовых", min_value=0.0, max_value=100.0, value=float(cfg["srate"]), step=0.5, key="set_srate")
-            new_start = st.number_input("Сумма накоплений на дату старта, ₽", min_value=0.0, value=float(cfg["start"]), step=1000.0, key="set_start")
-            new_sdate = st.date_input("Дата, с которой считать проценты", safe_date(cfg["sdate"], today), key="set_sdate")
-            if st.form_submit_button("Сохранить", type="primary"):
-                cfg["srate"], cfg["start"], cfg["sdate"] = float(new_rate), float(new_start), str(new_sdate)
-                commit()
-        st.caption("Проценты начисляются ежедневно с капитализацией; кешбек включается в накопления.")
-
-    chart_months = sorted(monthly)[-12:]
-    savings_chart = pd.DataFrame({
-        "Месяц": [month_label(month) for month in chart_months],
-        "Накоплено": [
-            savings_engine(min(today, dt.date(
-                int(month[:4]), int(month[5:]),
-                calendar.monthrange(int(month[:4]), int(month[5:]))[1],
-            )))[0]
-            for month in chart_months
-        ],
-    })
-    if len(savings_chart) > 1:
-        st.altair_chart(
-            alt.Chart(savings_chart)
-            .mark_area(line={"color": GREEN}, opacity=0.25)
-            .encode(
-                x=alt.X("Месяц:N", sort=list(savings_chart["Месяц"]), title=None),
-                y=alt.Y("Накоплено:Q", title=None),
-                tooltip=["Месяц", "Накоплено"],
-            )
-            .properties(height=180),
-            width="stretch",
-        )
-
-    st.markdown("**Операции**")
-    operation_labels = {"dep": "Положил", "wd": "Снял", "p25": "Отложил %", "rest": "Остаток"}
-    for entry in D["sav"][-15:][::-1]:
-        left, right = st.columns([6, 1])
-        label = operation_labels.get(entry.get("k"), entry.get("k", "Операция"))
-        sign = "−" if entry.get("k") == "wd" else "+"
-        left.write(f"{str(entry.get('d', ''))[5:]} · {label} · **{sign}{money(entry.get('a', 0))}** {entry.get('n', '')}")
-        if right.button("✕", key=f"delete_saving_{entry['id']}"):
-            trash("sav", entry)
-            commit()
-
-
-# ========================= История =========================
-
-with tab_history:
-    filter_col1, filter_col2 = st.columns(2)
-    date_range = filter_col1.date_input("Период", (today.replace(day=1), today), key="history_period")
-    type_labels = {"Траты": "e", "Кешбеки": "cb", "Доп. доходы": "in"}
-    selected_types = filter_col2.multiselect("Тип", list(type_labels), default=list(type_labels), key="history_types")
-    selected_categories = st.multiselect("Категории", sorted(set(D["cats"]) | set(F["c"])), key="history_categories")
-    search_text = st.text_input("Поиск по комментарию", key="history_search")
-
-    history = F[F["t"].isin([type_labels[label] for label in selected_types])].copy()
-    if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
-        history = history[(history["d"] >= date_range[0]) & (history["d"] <= date_range[1])]
-    if selected_categories:
-        history = history[history["c"].isin(selected_categories)]
-    if search_text:
-        history = history[history["n"].fillna("").astype(str).str.contains(search_text, case=False, regex=False)]
-    history = history.sort_values(["d", "id"], ascending=False)
-
-    st.caption(f"Найдено: {len(history)} · траты {money(history.loc[history['t'] == 'e', 'a'].sum())}" + (" · показаны первые 300" if len(history) > 300 else ""))
-
-    st.download_button(
-        "Скачать CSV",
-        history[["d", "c", "a", "n", "t"]].to_csv(index=False).encode("utf-8-sig"),
-        "expenses.csv",
-        mime="text/csv",
-        key="download_csv",
-    )
-
-    editable = (
-        history.head(300)[["id", "d", "c", "a", "n"]]
-        .assign(Удалить=False)
-        .set_index("id")
-    )
-    edited_history = st.data_editor(
-        editable,
-        hide_index=True,
-        width="stretch",
-        key="history_editor",
-        column_config={
-            "d": st.column_config.DateColumn("Дата"),
-            "c": st.column_config.SelectboxColumn("Категория", options=sorted(set(D["cats"]) | set(F["c"]) | {"Кешбек", "Доп. доход"})),
-            "a": st.column_config.NumberColumn("Сумма", min_value=0.01),
-            "n": st.column_config.TextColumn("Комментарий"),
-            "Удалить": st.column_config.CheckboxColumn("Удалить"),
-        },
-    )
-
-    if st.button("Сохранить изменения", type="primary", key="save_history"):
-        by_id = {str(entry["id"]): entry for entry in D["exp"]}
-        invalid = False
-        for row_id, row in edited_history.iterrows():
-            entry = by_id.get(str(row_id))
-            if entry is None:
-                continue
-            if row["Удалить"]:
-                trash("exp", entry)
-                continue
-            try:
-                amount = float(row["a"])
-                parsed_date = pd.to_datetime(row["d"], errors="raise").date()
-                category = str(row["c"]).strip()
-                if amount <= 0 or not category or category == "nan":
-                    raise ValueError("Сумма должна быть положительной, категория — заполненной.")
-            except Exception as error:
-                st.error(f"Проверь запись {row_id}: {error}")
-                invalid = True
-                break
-
-            entry.update(
-                d=str(parsed_date),
-                c=category,
-                a=amount,
-                n="" if pd.isna(row["n"]) else str(row["n"]),
-                t="cb" if category == "Кешбек" else "in" if category == "Доп. доход" else "e",
-            )
-        if not invalid:
-            D["exp"].sort(key=lambda item: (item["d"], item["id"]))
-            commit()
-
-    st.caption("Удалённые записи попадают в корзину во вкладке «Ещё».")
-
-
-# ========================= Группы и регулярные платежи =========================
-
-with tab_groups:
-    st.caption("Меняй группу у категории и добавляй новые категории внизу таблицы. Пустая группа будет заменена на «Прочее».")
-
-    groups_editor = st.data_editor(
-        pd.DataFrame({"Категория": list(D["cats"]), "Группа": list(D["cats"].values())}),
-        num_rows="dynamic",
-        width="stretch",
-        hide_index=True,
-        key="groups_editor",
-    )
-
-    if st.button("Сохранить группы", type="primary", key="save_groups"):
-        new_categories = {}
-        for _, row in groups_editor.iterrows():
-            category = "" if pd.isna(row["Категория"]) else str(row["Категория"]).strip()
-            group = "Прочее" if pd.isna(row["Группа"]) or not str(row["Группа"]).strip() else str(row["Группа"]).strip()
-            if category:
-                new_categories[category] = group
-        if not new_categories:
-            st.error("Список пуст — изменения не сохранены.")
+        st.markdown("**Где уходят деньги**")
+        by_group = current_expenses.groupby("g")["a"].sum().sort_values(ascending=False).reset_index()
+        if by_group.empty:
+            st.caption("В этом месяце трат пока нет.")
         else:
-            D["cats"] = new_categories
-            commit()
-
-    group_names = list(dict.fromkeys(D["cats"].values()))
-    st.markdown("**Бюджеты по группам (в месяц)**")
-    budget_editor = st.data_editor(
-        pd.DataFrame({"Группа": group_names, "Лимит, ₽": [safe_float(D["bud"].get(group, 0)) for group in group_names]}),
-        disabled=["Группа"],
-        hide_index=True,
-        width="stretch",
-        key="budget_editor",
-        column_config={"Лимит, ₽": st.column_config.NumberColumn("Лимит, ₽", min_value=0.0)},
-    )
-    if st.button("Сохранить бюджеты", key="save_budgets"):
-        D["bud"] = {
-            str(row["Группа"]): float(row["Лимит, ₽"])
-            for _, row in budget_editor.iterrows()
-            if not pd.isna(row["Лимит, ₽"]) and float(row["Лимит, ₽"]) > 0
-        }
-        commit()
-
-    st.markdown("**Регулярные платежи** (автоматически добавляются в расходы)")
-    recurring_frame = pd.DataFrame(D["rec"], columns=["c", "a", "day", "n", "last"])
-    recurring_frame["a"] = pd.to_numeric(recurring_frame["a"], errors="coerce")
-    recurring_frame["day"] = pd.to_numeric(recurring_frame["day"], errors="coerce")
-
-    recurring_editor = st.data_editor(
-        recurring_frame,
-        num_rows="dynamic",
-        hide_index=True,
-        width="stretch",
-        key="recurring_editor",
-        column_config={
-            "last": None,
-            "c": st.column_config.SelectboxColumn("Категория", options=sorted(D["cats"]), required=True),
-            "a": st.column_config.NumberColumn("Сумма", min_value=0.01),
-            "day": st.column_config.NumberColumn("День месяца", min_value=1, max_value=31, step=1),
-            "n": st.column_config.TextColumn("Комментарий"),
-        },
-    )
-
-    if st.button("Сохранить регулярные", key="save_recurring"):
-        recurring = []
-        previous_year, previous_month_number = month_before(today.year, today.month)
-        previous_month_text = f"{previous_year}-{previous_month_number:02d}"
-
-        for _, row in recurring_editor.iterrows():
-            if pd.isna(row["c"]) or pd.isna(row["a"]) or pd.isna(row["day"]):
-                continue
-            category = str(row["c"]).strip()
-            amount = safe_float(row["a"])
-            day_number = int(row["day"])
-            if not category or amount <= 0 or not 1 <= day_number <= 31:
-                continue
-
-            last_value = row["last"]
-            if isinstance(last_value, str) and re.fullmatch(r"\d{4}-\d{2}", last_value):
-                last_month = last_value
-            elif day_number <= today.day:
-                # День уже прошёл — считаем, что платёж этого месяца внесён вручную (без дублей).
-                last_month = current_month
-            else:
-                last_month = previous_month_text
-
-            recurring.append({
-                "c": category,
-                "a": amount,
-                "day": day_number,
-                "n": "" if pd.isna(row["n"]) else str(row["n"]),
-                "last": last_month,
-            })
-
-        D["rec"] = recurring
-        commit()
-
-
-# ========================= Ещё: настройки, корзина, резервные копии =========================
-
-with tab_more:
-    st.markdown("**Настройки**")
-    with st.form("settings_form"):
-        new_goal = st.number_input("Цель, ₽", min_value=1.0, value=float(cfg["goal"]), step=10000.0, key="set_goal")
-        new_income = st.number_input("Стандартный доход в месяц, ₽", min_value=0.0, value=float(cfg["income"]), step=1000.0, key="set_income")
-        new_pct = st.number_input("Откладывать, % дохода", min_value=0.0, max_value=100.0, value=float(cfg["pct"]), step=1.0, key="set_pct")
-        new_cap = st.number_input("Лимит трат в месяц, ₽", min_value=0.0, value=float(cfg["cap"]), step=1000.0, key="set_cap")
-        new_frm = st.date_input("Начало учёта остатков (месяц старта)", safe_date(cfg["frm"], today), key="set_frm")
-        if st.form_submit_button("Сохранить настройки", type="primary"):
-            cfg.update(goal=float(new_goal), income=float(new_income), pct=float(new_pct), cap=float(new_cap), frm=str(min(new_frm, today)))
-            commit()
-
-    st.divider()
-    st.markdown("**🗑 Корзина**")
-
-    if D["trash"]:
-        if st.button("Вернуть всё удалённое", key="restore_all_trash"):
-            for item in D["trash"]:
-                kind = item.get("k")
-                entry = item.get("e", {})
-                if kind in ("exp", "sav") and "id" in entry:
-                    existing_ids = {str(value["id"]) for value in D[kind]}
-                    if str(entry["id"]) not in existing_ids:
-                        D[kind].append(entry)
-            D["trash"] = []
-            for key in ("exp", "sav"):
-                D[key].sort(key=lambda item: (item["d"], item["id"]))
-            commit()
-
-        for item in D["trash"][-10:][::-1]:
-            left, right = st.columns([6, 1])
-            entry = item.get("e", {})
-            left.write(
-                f"{entry.get('d', '')} · {entry.get('c') or entry.get('k', 'Запись')} · "
-                f"{money(entry.get('a', 0))} (удалено {item.get('ts', '')[:16]})"
+            by_group["Подпись"] = by_group["a"].map(lambda value: f"{money(value)} · {value / spent:.0%}")
+            order_groups = list(by_group["g"])
+            bars = alt.Chart(by_group).mark_bar(color=BLUE, cornerRadiusEnd=4).encode(
+                y=alt.Y("g:N", sort=order_groups, title=None), x=alt.X("a:Q", title=None), tooltip=["g", "a"],
             )
-            if right.button("↩", key=f"restore_{item.get('id')}"):
-                kind = item.get("k")
-                if kind in ("exp", "sav"):
-                    D["trash"].remove(item)
-                    if str(entry.get("id")) not in {str(value["id"]) for value in D[kind]}:
-                        D[kind].append(entry)
-                    D[kind].sort(key=lambda value: (value["d"], value["id"]))
+            labels = alt.Chart(by_group).mark_text(align="left", dx=4).encode(y=alt.Y("g:N", sort=order_groups), x="a:Q", text="Подпись:N")
+            st.altair_chart((bars + labels).properties(height=max(120, 34 * len(by_group))), width="stretch")
+            st.caption(f"Обязательные: **{money(mandatory)}** ({mandatory / spent:.0%}) · гибкие: **{money(flexible)}** ({flexible / spent:.0%}). Экономить проще на гибких.")
+
+            st.markdown("**Что изменилось к прошлому месяцу** (за те же дни)")
+            diff = pd.DataFrame({"Сейчас": current_expenses.groupby("c")["a"].sum(), "Было": previous_same.groupby("c")["a"].sum()}).fillna(0)
+            diff["Разница"] = diff["Сейчас"] - diff["Было"]
+            growth = diff[diff["Разница"] > 0].sort_values("Разница", ascending=False).head(5)
+            decline = diff[diff["Разница"] < 0].sort_values("Разница").head(3)
+            changes = pd.concat([growth, decline]).rename_axis("Категория").reset_index()
+            if changes.empty:
+                st.caption("Существенных изменений нет.")
+            else:
+                changes["Категория"] = changes["Категория"].map(lambda value: f"{style_of(value)[0]} {value}")
+                st.dataframe(changes.round(0), hide_index=True, width="stretch")
+                st.caption("Сверху — категории, где траты выросли сильнее всего: первые кандидаты на экономию. Снизу — где стало меньше.")
+
+            top_flex = current_expenses[current_expenses["g"] != "Обязательные"].groupby("c")["a"].sum().sort_values(ascending=False).head(3)
+            if not top_flex.empty:
+                potential = float(top_flex.sum()) * 0.2
+                names = ", ".join(f"«{name}»" for name in top_flex.index)
+                tip = f"💡 Если снизить {names} на 20%, за месяц останется ещё ≈ {money(potential)}"
+                if monthly_addition > 0:
+                    tip += f" — цель приблизится примерно на {potential * 30.4 / monthly_addition:.0f} дн."
+                st.info(tip)
+
+        st.markdown("**Траты по дням**")
+        daily_data = pd.DataFrame({"День": range(1, days_in_month + 1)})
+        daily_data["Траты"] = [
+            float(current_expenses.loc[current_expenses["d"] == dt.date(year, month_number, day_number), "a"].sum())
+            for day_number in daily_data["День"]
+        ]
+        daily_data["Накопительно"] = daily_data["Траты"].cumsum()
+        daily_data["Лимит"] = [cfg["cap"] / days_in_month * day_number for day_number in daily_data["День"]]
+        if selected == current_month:
+            daily_data.loc[daily_data["День"] > today.day, "Накопительно"] = None
+        day_limit = cfg["cap"] / days_in_month if days_in_month else 0
+        st.altair_chart(
+            alt.Chart(daily_data).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+                x=alt.X("День:O", axis=alt.Axis(labelAngle=0, values=list(range(1, days_in_month + 1, 3)))),
+                y=alt.Y("Траты:Q", title=None),
+                color=alt.condition(alt.datum["Траты"] > day_limit, alt.value(RED), alt.value(GREEN)),
+                tooltip=["День", "Траты"],
+            ).properties(height=170),
+            width="stretch",
+        )
+        st.caption("Красные дни — выше дневного лимита. Видно, в какие дни случаются «пробои» бюджета.")
+        line_data = daily_data.melt("День", ["Накопительно", "Лимит"], "Показатель", "Значение")
+        st.altair_chart(
+            alt.Chart(line_data).mark_line(strokeWidth=3).encode(
+                x=alt.X("День:Q", title=None), y=alt.Y("Значение:Q", title=None),
+                color=alt.Color("Показатель:N", scale=alt.Scale(domain=["Накопительно", "Лимит"], range=[BLUE, "#9ca3af"]), title=None),
+                strokeDash=alt.condition(alt.datum["Показатель"] == "Лимит", alt.value([5, 4]), alt.value([0])),
+                tooltip=["День", "Показатель", "Значение"],
+            ).properties(height=170),
+            width="stretch",
+        )
+        st.caption("Синяя линия выше пунктирной — ты тратишь быстрее плана и рискуешь выйти за лимит месяца.")
+
+        weekday_window = E[E["d"] >= today - dt.timedelta(days=84)]
+        if not weekday_window.empty:
+            names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+            by_weekday = weekday_window.groupby(weekday_window["d"].map(lambda value: value.weekday()))["a"].sum() / 12
+            weekday_data = pd.DataFrame({"День недели": names, "В среднем": [float(by_weekday.get(index, 0)) for index in range(7)]})
+            st.markdown("**В какие дни недели тратишь больше**")
+            st.altair_chart(
+                alt.Chart(weekday_data).mark_bar(color=BLUE, cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+                    x=alt.X("День недели:N", sort=names, title=None, axis=alt.Axis(labelAngle=0)), y=alt.Y("В среднем:Q", title=None), tooltip=["День недели", "В среднем"],
+                ).properties(height=150),
+                width="stretch",
+            )
+            st.caption("Средние траты по дням недели за последние 12 недель — помогает понять привычки (например, выходные).")
+
+        if not current_expenses.empty:
+            st.markdown("**Крупнейшие траты месяца**")
+            biggest = current_expenses.nlargest(10, "a")[["d", "c", "a", "n"]].copy()
+            biggest["c"] = biggest["c"].map(lambda value: f"{style_of(value)[0]} {value}")
+            st.dataframe(biggest.rename(columns={"d": "Дата", "c": "Категория", "a": "Сумма", "n": "Комментарий"}), hide_index=True, width="stretch")
+            st.caption("Разовые крупные покупки обычно дают основную часть месяца — их стоит планировать заранее.")
+
+        monthly_rows = []
+        for month in sorted(set(F["m"].tolist()) | set(monthly))[-12:]:
+            month_spent = float(E.loc[E["m"] == month, "a"].sum())
+            month_income_value = (
+                monthly[month]["inc"] if month in monthly
+                else safe_float(D["inc"].get(month, cfg["income"]), cfg["income"]) + float(I.loc[I["m"] == month, "a"].sum())
+            )
+            month_saved = (
+                float(S.loc[(S["m"] == month) & (S["k"] != "wd"), "a"].sum()) + float(C.loc[C["m"] == month, "a"].sum())
+                - float(S.loc[(S["m"] == month) & (S["k"] == "wd"), "a"].sum())
+            )
+            monthly_rows.append({
+                "Месяц": month_label(month), "Доход": month_income_value, "Траты": month_spent, "Отложено": month_saved,
+                "% отложено": round(month_saved / month_income_value * 100) if month_income_value else 0,
+            })
+        monthly_table = pd.DataFrame(monthly_rows)
+        if not monthly_table.empty:
+            st.markdown("**Динамика по месяцам**")
+            st.altair_chart(
+                alt.Chart(monthly_table.melt("Месяц", ["Доход", "Траты", "Отложено"], "Тип", "Сумма")).mark_bar().encode(
+                    x=alt.X("Месяц:N", sort=list(monthly_table["Месяц"]), title=None), y=alt.Y("Сумма:Q", title=None), xOffset="Тип:N",
+                    color=alt.Color("Тип:N", scale=alt.Scale(domain=["Доход", "Траты", "Отложено"], range=[BLUE, RED, GREEN]), title=None),
+                    tooltip=["Месяц", "Тип", "Сумма"],
+                ).properties(height=220),
+                width="stretch",
+            )
+            st.dataframe(monthly_table.iloc[::-1].round(0), hide_index=True, width="stretch")
+            st.caption("Главный вопрос раздела: растёт ли «% отложено» до цели (25% дохода и выше) и не съедают ли траты доход.")
+
+
+    # ========================= Накопления =========================
+
+    if page == P_SAV:
+        st.metric("Накоплено", money(balance), f"проценты {money(interest)}", delta_color="off")
+        savings_col1, savings_col2 = st.columns(2)
+        savings_col1.metric("Вложено своих", money(principal))
+        savings_col2.metric("Доход за год при текущей сумме", money(year_interest), f"≈ {money(year_interest / 12)} в месяц", delta_color="off")
+
+        with st.expander("Ставка и стартовая сумма", expanded=False):
+            with st.form("savings_settings_form"):
+                new_rate = st.number_input("Ставка по накоплениям, % годовых", min_value=0.0, max_value=100.0, value=float(cfg["srate"]), step=0.5, key="set_srate")
+                new_start = st.number_input("Сумма накоплений на дату старта, ₽", min_value=0.0, value=float(cfg["start"]), step=1000.0, key="set_start")
+                new_sdate = st.date_input("Дата, с которой считать проценты", safe_date(cfg["sdate"], today), key="set_sdate")
+                if st.form_submit_button("Сохранить", type="primary"):
+                    cfg["srate"], cfg["start"], cfg["sdate"] = float(new_rate), float(new_start), str(new_sdate)
+                    log("savings_settings_saved", rate=float(new_rate))
                     commit()
-    else:
-        st.caption("Корзина пуста.")
+            st.caption("Проценты начисляются ежедневно с капитализацией; кешбек включается в накопления.")
 
-    st.divider()
-    st.markdown("**♻️ Резервные копии**")
-    st.caption("Резервная копия предыдущего состояния создаётся при каждом успешном сохранении.")
+        chart_months = sorted(monthly)[-12:]
+        savings_chart = pd.DataFrame({
+            "Месяц": [month_label(month) for month in chart_months],
+            "Накоплено": [
+                savings_engine(min(today, dt.date(int(month[:4]), int(month[5:]), calendar.monthrange(int(month[:4]), int(month[5:]))[1])))[0]
+                for month in chart_months
+            ],
+        })
+        if len(savings_chart) > 1:
+            st.altair_chart(
+                alt.Chart(savings_chart).mark_area(line={"color": GREEN}, opacity=0.25).encode(
+                    x=alt.X("Месяц:N", sort=list(savings_chart["Месяц"]), title=None), y=alt.Y("Накоплено:Q", title=None), tooltip=["Месяц", "Накоплено"],
+                ).properties(height=180),
+                width="stretch",
+            )
 
-    try:
-        backup_names = slist()
-    except Exception as error:
-        backup_names = []
-        st.error(f"Не удалось получить список резервных копий: {error}")
+        st.markdown("**Операции**")
+        operation_labels = {"dep": "Положил", "wd": "Снял", "p25": "Отложил %", "rest": "Остаток"}
+        for entry in D["sav"][-15:][::-1]:
+            left, right = st.columns([6, 1])
+            label = operation_labels.get(entry.get("k"), entry.get("k", "Операция"))
+            sign = "−" if entry.get("k") == "wd" else "+"
+            left.write(f"{str(entry.get('d', ''))[5:]} · {label} · **{sign}{money(entry.get('a', 0))}** {entry.get('n', '')}")
+            if right.button("✕", key=f"delete_saving_{entry['id']}"):
+                trash("sav", entry)
+                commit()
 
-    if backup_names:
-        selected_backup = st.selectbox(
-            "Версия",
-            backup_names[:200],
-            format_func=lambda name: (
-                f"{name[:4]}-{name[4:6]}-{name[6:8]} "
-                f"{name[9:11]}:{name[11:13]}:{name[13:15]}"
-                if len(name) >= 15 else name
-            ),
-            key="backup_select",
+
+    # ========================= История =========================
+
+    if page == P_HIS:
+        filter_col1, filter_col2 = st.columns(2)
+        date_range = filter_col1.date_input("Период", (today.replace(day=1), today), key="history_period")
+        type_labels = {"Траты": "e", "Кешбеки": "cb", "Доп. доходы": "in"}
+        selected_types = filter_col2.multiselect("Тип", list(type_labels), default=list(type_labels), key="history_types")
+        selected_categories = st.multiselect("Категории", sorted(set(D["cats"]) | set(F["c"])), key="history_categories")
+        search_text = st.text_input("Поиск по комментарию", key="history_search")
+
+        history = F[F["t"].isin([type_labels[label] for label in selected_types])].copy()
+        if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+            history = history[(history["d"] >= date_range[0]) & (history["d"] <= date_range[1])]
+        if selected_categories:
+            history = history[history["c"].isin(selected_categories)]
+        if search_text:
+            history = history[history["n"].fillna("").astype(str).str.contains(search_text, case=False, regex=False)]
+        history = history.sort_values(["d", "id"], ascending=False)
+
+        st.caption(f"Найдено: {len(history)} · траты {money(history.loc[history['t'] == 'e', 'a'].sum())}" + (" · показаны первые 300" if len(history) > 300 else ""))
+        st.download_button("Скачать CSV", history[["d", "c", "a", "n", "t"]].to_csv(index=False).encode("utf-8-sig"), "expenses.csv", mime="text/csv", key="download_csv")
+
+        editable = history.head(300)[["id", "d", "c", "a", "n"]].assign(Удалить=False).set_index("id")
+        edited_history = st.data_editor(
+            editable, hide_index=True, width="stretch", key="history_editor",
+            column_config={
+                "d": st.column_config.DateColumn("Дата"),
+                "c": st.column_config.SelectboxColumn("Категория", options=sorted(set(D["cats"]) | set(F["c"]) | {"Кешбек", "Доп. доход"})),
+                "a": st.column_config.NumberColumn("Сумма", min_value=0.01),
+                "n": st.column_config.TextColumn("Комментарий"),
+                "Удалить": st.column_config.CheckboxColumn("Удалить"),
+            },
         )
 
-        if st.button("Показать, что в копии", key="show_backup"):
-            try:
-                preview_data = sget("backups/" + selected_backup)
-                if preview_data is None:
-                    st.error("Файл резервной копии не найден.")
-                else:
-                    st.session_state.backup_preview = migrate(preview_data)
-            except Exception as error:
-                st.error(f"Не удалось прочитать копию: {error}")
-
-        preview = st.session_state.get("backup_preview")
-        if preview:
-            st.info(
-                f"Записей расходов/доходов: {len(preview['exp'])} · "
-                f"операций накоплений: {len(preview['sav'])} · "
-                f"категорий: {len(preview['cats'])} · "
-                f"групп: {len(set(preview['cats'].values()))}"
-            )
-            restore_all_col, restore_groups_col, restore_records_col = st.columns(3)
-
-            if restore_all_col.button("Восстановить всё", key="restore_backup_all"):
+        if st.button("Сохранить изменения", type="primary", key="save_history"):
+            by_id = {str(entry["id"]): entry for entry in D["exp"]}
+            invalid = False
+            for row_id, row in edited_history.iterrows():
+                entry = by_id.get(str(row_id))
+                if entry is None:
+                    continue
+                if row["Удалить"]:
+                    trash("exp", entry)
+                    continue
                 try:
-                    remote_now = sget("data.json")
-                    st.session_state.base = (remote_now or {}).get("rev", 0)
-                    st.session_state.D = migrate(preview)
-                    commit()
+                    amount = float(row["a"])
+                    parsed_date = pd.to_datetime(row["d"], errors="raise").date()
+                    category = str(row["c"]).strip()
+                    if amount <= 0 or not category or category == "nan":
+                        raise ValueError("Сумма должна быть положительной, категория — заполненной.")
                 except Exception as error:
-                    st.error(f"Не удалось восстановить копию: {error}")
-
-            if restore_groups_col.button("Только группы и бюджеты", key="restore_backup_groups"):
-                D["cats"] = preview["cats"]
-                D["bud"] = preview["bud"]
-                D["rec"] = preview["rec"]
-                commit()
-
-            if restore_records_col.button("Только траты и накопления", key="restore_backup_records"):
-                D["exp"] = preview["exp"]
-                D["sav"] = preview["sav"]
-                D["inc"] = preview["inc"]
-                commit()
-    else:
-        st.caption("Резервных копий пока нет.")
-
-    refresh_col, download_col = st.columns(2)
-    if refresh_col.button("🔄 Обновить с Яндекс.Диска", key="refresh_remote"):
-        try:
-            remote_data = sget("data.json")
-            if remote_data is None:
-                st.warning("На Яндекс.Диске пока нет основного файла.")
-            else:
-                st.session_state.D = migrate(remote_data)
-                st.session_state.base = remote_data.get("rev", 0)
-                st.rerun()
-        except Exception as error:
-            st.error(f"Не удалось обновить данные: {error}")
-
-    download_col.download_button(
-        "⬇️ Скачать полную копию",
-        json.dumps(D, ensure_ascii=False, indent=2),
-        "million-backup.json",
-        mime="application/json",
-        key="download_backup",
-    )
-
-    backup_file = st.file_uploader("Восстановить из файла копии (JSON)", type="json", key="json_backup_upload")
-    if backup_file and st.button("Загрузить файл в приложение", key="import_json"):
-        try:
-            imported = migrate(json.load(backup_file))
-            st.session_state.D = merge(D, imported)
-            commit()
-        except Exception as error:
-            st.error(f"Не удалось импортировать JSON: {error}")
-
-    github = sec("github")
-    if github:
-        st.divider()
-        st.markdown("**Импорт истории из старого хранилища GitHub** (разово)")
-        try:
-            token = github.get("token") if isinstance(github, Mapping) else None
-            repository = github.get("repo") if isinstance(github, Mapping) else None
-            github_path = github.get("path", "data.json") if isinstance(github, Mapping) else "data.json"
-            if not token or not repository:
-                st.warning("В Secrets для GitHub нужны поля token и repo.")
-            else:
-                headers = {"Authorization": "token " + str(token)}
-                commits_response = requests.get(
-                    f"https://api.github.com/repos/{repository}/commits",
-                    params={"path": github_path, "per_page": 40},
-                    headers=headers,
-                    timeout=20,
-                )
-                commits_response.raise_for_status()
-                commits = commits_response.json()
-                if not isinstance(commits, list):
-                    raise ValueError("GitHub вернул неожиданный формат списка версий.")
-
-                if commits:
-                    selected_commit = st.selectbox(
-                        "Версия в истории Git",
-                        commits,
-                        format_func=lambda item: item.get("commit", {}).get("author", {}).get("date", "")[:16].replace("T", " "),
-                        key="github_commit_select",
-                    )
-                    if st.button("Показать версию", key="show_github_version"):
-                        content_response = requests.get(
-                            f"https://api.github.com/repos/{repository}/contents/{github_path}",
-                            params={"ref": selected_commit["sha"]},
-                            headers=headers,
-                            timeout=20,
-                        )
-                        content_response.raise_for_status()
-                        decoded = base64.b64decode(content_response.json()["content"]).decode("utf-8")
-                        st.session_state.github_preview = migrate(json.loads(decoded))
-
-                    github_preview = st.session_state.get("github_preview")
-                    if github_preview:
-                        st.info(f"В версии записей: {len(github_preview['exp'])}, категорий: {len(github_preview['cats'])}")
-                        if st.button("Добавить эти данные к текущим", key="merge_github"):
-                            st.session_state.D = merge(D, github_preview)
-                            commit()
-                else:
-                    st.caption("В указанном репозитории не найдены версии этого файла.")
-        except Exception as error:
-            st.caption(f"GitHub недоступен или вернул ошибку: {error}")
-
-    st.divider()
-    st.markdown("**Импорт из Excel** (лист «Расходы»)")
-    excel_file = st.file_uploader("Файл .xlsx", type="xlsx", key="excel_import")
-    if excel_file and st.button("Импортировать", key="import_excel"):
-        try:
-            excel_file.seek(0)
-            excel_data = pd.read_excel(excel_file, sheet_name="Расходы", header=None)
-            if excel_data.empty or excel_data.shape[1] < 9:
-                raise ValueError("В листе «Расходы» недостаточно столбцов.")
-
-            header_rows = excel_data.index[
-                excel_data.iloc[:, 0].astype(str).str.strip() == "Дата и время"
-            ].tolist()
-            if not header_rows:
-                raise ValueError("Не найдена строка заголовка «Дата и время».")
-
-            data_rows = excel_data.iloc[header_rows[0] + 1:]
-            existing = {
-                (entry.get("d"), entry.get("c"), safe_float(entry.get("a")), entry.get("n", ""))
-                for entry in D["exp"]
-            }
-            imported_count = 0
-
-            for _, row in data_rows.iterrows():
-                parsed_date = pd.to_datetime(row.iloc[0], errors="coerce")
-                category = "" if pd.isna(row.iloc[1]) else str(row.iloc[1]).strip()
-                amount = pd.to_numeric(row.iloc[3], errors="coerce")
-                comment = "" if pd.isna(row.iloc[8]) else str(row.iloc[8]).strip()
-
-                if (
-                    pd.isna(parsed_date) or pd.isna(amount) or float(amount) <= 0
-                    or not category or category in ("Накопления", "nan")
-                ):
-                    continue
-
-                date_text = str(parsed_date.date())
-                duplicate_key = (date_text, category, float(amount), comment)
-                if duplicate_key in existing:
-                    continue
-
-                D["cats"].setdefault(category, "Прочее")
-                existing.add(duplicate_key)
-                add("exp", d=date_text, c=category, a=float(amount), n=comment, t="e")
-                imported_count += 1
-
-            st.success(f"Добавлено записей: {imported_count}")
-            commit()
-        except Exception as error:
-            st.error(f"Не удалось импортировать Excel: {error}")
-
-
-# ========================= Автоматическое добавление регулярных платежей =========================
-
-def apply_recurring_payments():
-    changed = False
-
-    for recurring in D["rec"]:
-        try:
-            last_text = recurring.get("last")
-            if not isinstance(last_text, str) or not re.fullmatch(r"\d{4}-\d{2}", last_text):
-                year, month = month_before(today.year, today.month)
-            else:
-                year, month = map(int, last_text.split("-"))
-
-            day_number = min(31, max(1, int(recurring["day"])))
-            amount = float(recurring["a"])
-            if amount <= 0:
-                continue
-
-            while (year, month) < (today.year, today.month):
-                year, month = (year + 1, 1) if month == 12 else (year, month + 1)
-                payment_date = dt.date(year, month, min(day_number, calendar.monthrange(year, month)[1]))
-
-                if payment_date > today:
+                    log("validation_error", where="history", error=str(error)[:120])
+                    st.error(f"Проверь запись {row_id}: {error}")
+                    invalid = True
                     break
-
-                note = ("авто " + str(recurring.get("n", ""))).strip()
-                duplicate = any(
-                    entry.get("t", "e") == "e"
-                    and entry.get("n", "") == note
-                    and entry.get("c") == recurring["c"]
-                    and entry.get("d") == str(payment_date)
-                    and abs(safe_float(entry.get("a")) - amount) < 0.001
-                    for entry in D["exp"]
+                entry.update(
+                    d=str(parsed_date), c=category, a=amount, n="" if pd.isna(row["n"]) else str(row["n"]),
+                    t="cb" if category == "Кешбек" else "in" if category == "Доп. доход" else "e",
                 )
-                if not duplicate:
-                    add("exp", d=str(payment_date), c=recurring["c"], a=amount, n=note, t="e")
+            if not invalid:
+                D["exp"].sort(key=lambda item: (item["d"], item["id"]))
+                log("history_saved")
+                commit()
 
-                recurring["last"] = f"{year}-{month:02d}"
-                changed = True
-
-        except (KeyError, TypeError, ValueError):
-            continue
-
-    if changed:
-        commit()
+        st.caption("Удалённые записи попадают в корзину в разделе «Ещё».")
 
 
-apply_recurring_payments()
+    # ========================= Группы =========================
+
+    if page == P_GRP:
+        st.caption("Меняй группу, иконку и цвет категорий; новые категории добавляй внизу таблицы. Иконка и цвет видны на странице «Внести».")
+        icon_options = ICONS + sorted({style_of(category)[0] for category in D["cats"]} - set(ICONS))
+        group_rows = [
+            {"Категория": category, "Группа": D["cats"][category], "Иконка": style_of(category)[0], "Цвет": style_of(category)[2]}
+            for category in D["cats"]
+        ]
+        groups_editor = st.data_editor(
+            pd.DataFrame(group_rows, columns=["Категория", "Группа", "Иконка", "Цвет"]),
+            num_rows="dynamic", width="stretch", hide_index=True, key="groups_editor",
+            column_config={
+                "Иконка": st.column_config.SelectboxColumn("Иконка", options=icon_options),
+                "Цвет": st.column_config.SelectboxColumn("Цвет", options=list(COLORS)),
+            },
+        )
+
+        chips = "".join(
+            f"<span style='display:inline-block;margin:2px;padding:4px 10px;border-radius:14px;border:1px solid {style_of(c)[1]};background:{style_of(c)[1]}22'>{style_of(c)[0]} {c}</span>"
+            for c in D["cats"]
+        )
+        st.html(f"<div style='line-height:2'>{chips}</div>")
+
+        if st.button("Сохранить группы", type="primary", key="save_groups"):
+            new_categories, new_style = {}, {}
+            for _, row in groups_editor.iterrows():
+                category = "" if pd.isna(row["Категория"]) else str(row["Категория"]).strip()
+                group = "Прочее" if pd.isna(row["Группа"]) or not str(row["Группа"]).strip() else str(row["Группа"]).strip()
+                if not category:
+                    continue
+                new_categories[category] = group
+                icon = "" if pd.isna(row.get("Иконка")) else str(row.get("Иконка"))
+                color = "" if pd.isna(row.get("Цвет")) else str(row.get("Цвет"))
+                if icon or color in COLORS:
+                    new_style[category] = {"i": icon, "c": color if color in COLORS else ""}
+            if not new_categories:
+                st.error("Список пуст — изменения не сохранены.")
+            else:
+                D["cats"], D["style"] = new_categories, new_style
+                log("groups_saved", categories=len(new_categories))
+                commit()
+
+        group_names = list(dict.fromkeys(D["cats"].values()))
+        st.markdown("**Бюджеты по группам (в месяц)**")
+        budget_editor = st.data_editor(
+            pd.DataFrame({"Группа": group_names, "Лимит, ₽": [safe_float(D["bud"].get(group, 0)) for group in group_names]}),
+            disabled=["Группа"], hide_index=True, width="stretch", key="budget_editor",
+            column_config={"Лимит, ₽": st.column_config.NumberColumn("Лимит, ₽", min_value=0.0)},
+        )
+        if st.button("Сохранить бюджеты", key="save_budgets"):
+            D["bud"] = {
+                str(row["Группа"]): float(row["Лимит, ₽"]) for _, row in budget_editor.iterrows()
+                if not pd.isna(row["Лимит, ₽"]) and float(row["Лимит, ₽"]) > 0
+            }
+            log("budgets_saved", groups=len(D["bud"]))
+            commit()
+
+        st.markdown("**Регулярные платежи** — обязательные траты: добавляются в расходы в свой день, а с 1-го числа вычитаются из остатка")
+        recurring_frame = pd.DataFrame(D["rec"], columns=["c", "a", "day", "n", "last"])
+        recurring_frame["a"] = pd.to_numeric(recurring_frame["a"], errors="coerce")
+        recurring_frame["day"] = pd.to_numeric(recurring_frame["day"], errors="coerce")
+        recurring_editor = st.data_editor(
+            recurring_frame, num_rows="dynamic", hide_index=True, width="stretch", key="recurring_editor",
+            column_config={
+                "last": None,
+                "c": st.column_config.SelectboxColumn("Категория", options=sorted(D["cats"]), required=True),
+                "a": st.column_config.NumberColumn("Сумма", min_value=0.01),
+                "day": st.column_config.NumberColumn("День месяца", min_value=1, max_value=31, step=1),
+                "n": st.column_config.TextColumn("Комментарий"),
+            },
+        )
+        if st.button("Сохранить регулярные", key="save_recurring"):
+            recurring = []
+            previous_year, previous_month_number = month_before(today.year, today.month)
+            for _, row in recurring_editor.iterrows():
+                if pd.isna(row["c"]) or pd.isna(row["a"]) or pd.isna(row["day"]):
+                    continue
+                category, amount, day_number = str(row["c"]).strip(), safe_float(row["a"]), int(row["day"])
+                if not category or amount <= 0 or not 1 <= day_number <= 31:
+                    continue
+                last_value = row["last"]
+                if isinstance(last_value, str) and re.fullmatch(r"\d{4}-\d{2}", last_value):
+                    last_month = last_value
+                elif day_number <= today.day:
+                    last_month = current_month        # день уже прошёл: считаем, что внесено вручную (без дублей)
+                else:
+                    last_month = f"{previous_year}-{previous_month_number:02d}"
+                recurring.append({"c": category, "a": amount, "day": day_number, "n": "" if pd.isna(row["n"]) else str(row["n"]), "last": last_month})
+            D["rec"] = recurring
+            log("recurring_saved", count=len(recurring))
+            commit()
+
+
+    # ========================= Ещё: настройки, корзина, копии, логи =========================
+
+    if page == P_MORE:
+        st.markdown("**Настройки**")
+        with st.form("settings_form"):
+            new_goal = st.number_input("Цель, ₽", min_value=1.0, value=float(cfg["goal"]), step=10000.0, key="set_goal")
+            new_income = st.number_input("Стандартный доход в месяц, ₽", min_value=0.0, value=float(cfg["income"]), step=1000.0, key="set_income")
+            new_pct = st.number_input("Откладывать, % дохода", min_value=0.0, max_value=100.0, value=float(cfg["pct"]), step=1.0, key="set_pct")
+            new_cap = st.number_input("Лимит трат в месяц, ₽", min_value=0.0, value=float(cfg["cap"]), step=1000.0, key="set_cap")
+            new_frm = st.date_input("Начало учёта остатков (месяц старта)", safe_date(cfg["frm"], today), key="set_frm")
+            if st.form_submit_button("Сохранить настройки", type="primary"):
+                cfg.update(goal=float(new_goal), income=float(new_income), pct=float(new_pct), cap=float(new_cap), frm=str(min(new_frm, today)))
+                log("settings_saved")
+                commit()
+
+        st.divider()
+        st.markdown("**🗑 Корзина**")
+        if D["trash"]:
+            if st.button("Вернуть всё удалённое", key="restore_all_trash"):
+                for item in D["trash"]:
+                    kind, entry = item.get("k"), item.get("e", {})
+                    if kind in ("exp", "sav") and "id" in entry and str(entry["id"]) not in {str(v["id"]) for v in D[kind]}:
+                        D[kind].append(entry)
+                D["trash"] = []
+                for key in ("exp", "sav"):
+                    D[key].sort(key=lambda item: (item["d"], item["id"]))
+                log("trash_restore_all")
+                commit()
+            for item in D["trash"][-10:][::-1]:
+                left, right = st.columns([6, 1])
+                entry = item.get("e", {})
+                left.write(f"{entry.get('d', '')} · {entry.get('c') or entry.get('k', 'Запись')} · {money(entry.get('a', 0))} (удалено {item.get('ts', '')[:16]})")
+                if right.button("↩", key=f"restore_{item.get('id')}"):
+                    kind = item.get("k")
+                    if kind in ("exp", "sav"):
+                        D["trash"].remove(item)
+                        if str(entry.get("id")) not in {str(v["id"]) for v in D[kind]}:
+                            D[kind].append(entry)
+                        D[kind].sort(key=lambda value: (value["d"], value["id"]))
+                        log("trash_restore_one", kind=kind)
+                        commit()
+        else:
+            st.caption("Корзина пуста.")
+
+        st.divider()
+        st.markdown("**♻️ Резервные копии**")
+        st.caption("Резервная копия предыдущего состояния создаётся при каждом успешном сохранении.")
+        try:
+            backup_names = slist()
+        except Exception as error:
+            backup_names = []
+            st.error(f"Не удалось получить список резервных копий: {error}")
+
+        if backup_names:
+            selected_backup = st.selectbox(
+                "Версия", backup_names[:200], key="backup_select",
+                format_func=lambda name: f"{name[:4]}-{name[4:6]}-{name[6:8]} {name[9:11]}:{name[11:13]}:{name[13:15]}" if len(name) >= 15 else name,
+            )
+            if st.button("Показать, что в копии", key="show_backup"):
+                try:
+                    preview_data = sget("backups/" + selected_backup)
+                    if preview_data is None:
+                        st.error("Файл резервной копии не найден.")
+                    else:
+                        st.session_state.backup_preview = migrate(preview_data)
+                except Exception as error:
+                    st.error(f"Не удалось прочитать копию: {error}")
+
+            preview = st.session_state.get("backup_preview")
+            if preview:
+                st.info(
+                    f"Записей расходов/доходов: {len(preview['exp'])} · операций накоплений: {len(preview['sav'])} · "
+                    f"категорий: {len(preview['cats'])} · групп: {len(set(preview['cats'].values()))}"
+                )
+                restore_all_col, restore_groups_col, restore_records_col = st.columns(3)
+                if restore_all_col.button("Восстановить всё", key="restore_backup_all"):
+                    try:
+                        remote_now = sget("data.json")
+                        st.session_state.base = (remote_now or {}).get("rev", 0)
+                        st.session_state.D = migrate(preview)
+                        log("backup_restore", mode="all")
+                        commit()
+                    except Exception as error:
+                        st.error(f"Не удалось восстановить копию: {error}")
+                if restore_groups_col.button("Только группы и бюджеты", key="restore_backup_groups"):
+                    D["cats"], D["bud"], D["rec"], D["style"] = preview["cats"], preview["bud"], preview["rec"], preview["style"]
+                    log("backup_restore", mode="groups")
+                    commit()
+                if restore_records_col.button("Только траты и накопления", key="restore_backup_records"):
+                    D["exp"], D["sav"], D["inc"] = preview["exp"], preview["sav"], preview["inc"]
+                    log("backup_restore", mode="records")
+                    commit()
+        else:
+            st.caption("Резервных копий пока нет.")
+
+        refresh_col, download_col = st.columns(2)
+        if refresh_col.button("🔄 Обновить с Яндекс.Диска", key="refresh_remote"):
+            try:
+                remote_data = sget("data.json")
+                if remote_data is None:
+                    st.warning("На Яндекс.Диске пока нет основного файла.")
+                else:
+                    st.session_state.D = migrate(remote_data)
+                    st.session_state.base = remote_data.get("rev", 0)
+                    log("refresh_remote")
+                    st.rerun()
+            except Exception as error:
+                log("refresh_fail", error=str(error)[:200])
+                st.error(f"Не удалось обновить данные: {error}")
+        download_col.download_button("⬇️ Скачать полную копию", json.dumps(D, ensure_ascii=False, indent=2), "million-backup.json", mime="application/json", key="download_backup")
+
+        backup_file = st.file_uploader("Восстановить из файла копии (JSON)", type="json", key="json_backup_upload")
+        if backup_file and st.button("Загрузить файл в приложение", key="import_json"):
+            try:
+                imported = migrate(json.load(backup_file))
+                st.session_state.D = merge(D, imported)
+                log("import_json", exp=len(imported["exp"]))
+                commit()
+            except Exception as error:
+                log("import_json_fail", error=str(error)[:200])
+                st.error(f"Не удалось импортировать JSON: {error}")
+
+        st.divider()
+        st.markdown("**Импорт из Excel** (лист «Расходы»)")
+        excel_file = st.file_uploader("Файл .xlsx", type="xlsx", key="excel_import")
+        if excel_file and st.button("Импортировать", key="import_excel"):
+            try:
+                excel_file.seek(0)
+                excel_data = pd.read_excel(excel_file, sheet_name="Расходы", header=None)
+                if excel_data.empty or excel_data.shape[1] < 9:
+                    raise ValueError("В листе «Расходы» недостаточно столбцов.")
+                header_rows = excel_data.index[excel_data.iloc[:, 0].astype(str).str.strip() == "Дата и время"].tolist()
+                if not header_rows:
+                    raise ValueError("Не найдена строка заголовка «Дата и время».")
+
+                existing = {(e.get("d"), e.get("c"), safe_float(e.get("a")), e.get("n", "")) for e in D["exp"]}
+                imported_count = 0
+                for _, row in excel_data.iloc[header_rows[0] + 1:].iterrows():
+                    parsed_date = pd.to_datetime(row.iloc[0], errors="coerce")
+                    category = "" if pd.isna(row.iloc[1]) else str(row.iloc[1]).strip()
+                    amount = pd.to_numeric(row.iloc[3], errors="coerce")
+                    comment = "" if pd.isna(row.iloc[8]) else str(row.iloc[8]).strip()
+                    if pd.isna(parsed_date) or pd.isna(amount) or float(amount) <= 0 or not category or category in ("Накопления", "nan"):
+                        continue
+                    date_text = str(parsed_date.date())
+                    key = (date_text, category, float(amount), comment)
+                    if key in existing:
+                        continue
+                    D["cats"].setdefault(category, "Прочее")
+                    existing.add(key)
+                    add("exp", via="excel", d=date_text, c=category, a=float(amount), n=comment, t="e")
+                    imported_count += 1
+                st.success(f"Добавлено записей: {imported_count}")
+                log("import_excel", count=imported_count)
+                commit()
+            except Exception as error:
+                log("import_excel_fail", error=str(error)[:200])
+                st.error(f"Не удалось импортировать Excel: {error}")
+
+        st.divider()
+        st.markdown("**🧾 Логи для улучшения приложения**")
+        st.caption("Действия, ошибки и время работы пишутся на Яндекс.Диск в папку «logs» (по файлу на каждый сеанс). Паролей, токенов и комментариев к тратам в логах нет.")
+        session_events = st.session_state.get("log_all", [])
+        log_col1, log_col2 = st.columns(2)
+        if log_col1.button("Отправить логи сейчас", key="flush_logs"):
+            if flush_logs():
+                st.success("Логи записаны на Яндекс.Диск.")
+            else:
+                st.error("Не удалось записать логи (они остаются в сессии).")
+        log_col2.download_button("⬇️ Лог этого сеанса", json.dumps(session_events, ensure_ascii=False, indent=2), "session-log.json", mime="application/json", key="download_session_log")
+        st.caption(f"Событий в этом сеансе: {len(session_events)}")
+        if st.button("Собрать все логи в один файл", key="collect_logs"):
+            try:
+                collected = []
+                for name in slist("logs")[:300]:
+                    part = sget("logs/" + name)
+                    if isinstance(part, dict):
+                        collected.append(part)
+                st.session_state["all_logs_json"] = json.dumps(collected, ensure_ascii=False, indent=2)
+                st.session_state["all_logs_count"] = len(collected)
+            except Exception as error:
+                st.error(f"Не удалось собрать логи: {error}")
+        if st.session_state.get("all_logs_json"):
+            st.download_button(f"⬇️ Скачать все логи ({st.session_state.get('all_logs_count', 0)} сеансов)", st.session_state["all_logs_json"], "all-logs.json", mime="application/json", key="download_all_logs")
+
+
+try:
+    run_ui()
+except Exception as error:            # сбой интерфейса: записываем в лог и показываем стандартную ошибку Streamlit
+    log("ui_exception", error=str(error)[:300], trace=traceback.format_exc()[-1200:])
+    flush_logs()
+    raise
