@@ -152,6 +152,27 @@ def local_path(path):
     return full
 
 
+RETRY_STATUSES = (429, 500, 502, 503, 504)
+RETRY_DELAYS = (1, 2, 4)      # паузы между повторами при временных сбоях Яндекс.Диска, сек.
+
+
+def ycall(method, url, **kwargs):
+    """Запрос к Яндекс.Диску с повторами при временных сбоях (503, 429, обрыв связи)."""
+    response, last_error = None, None
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        try:
+            response = getattr(requests, method)(url, **kwargs)
+            if response.status_code not in RETRY_STATUSES:
+                return response
+        except (requests.ConnectionError, requests.Timeout) as error:
+            last_error, response = error, None
+        if attempt < len(RETRY_DELAYS):
+            time.sleep(RETRY_DELAYS[attempt])
+    if response is not None:
+        return response
+    raise last_error
+
+
 def sget(path):
     if LOCAL:
         full = os.path.join(LOCAL, path)
@@ -160,17 +181,15 @@ def sget(path):
         with open(full, "r", encoding="utf-8") as file:
             return json.load(file)
 
-    response = requests.get(
-        YANDEX_API + "/resources/download",
-        params={"path": "app:/" + path},
-        headers=yandex_headers(),
-        timeout=20,
+    response = ycall(
+        "get", YANDEX_API + "/resources/download",
+        params={"path": "app:/" + path}, headers=yandex_headers(), timeout=20,
     )
     if response.status_code == 404:
         return None
     response.raise_for_status()
 
-    download = requests.get(response.json()["href"], timeout=30)
+    download = ycall("get", response.json()["href"], timeout=30)
     download.raise_for_status()
     return download.json()
 
@@ -186,26 +205,35 @@ def sput(path, value):
     folder = path.split("/")[0] if "/" in path else None
     ready = st.session_state.setdefault("yandex_dirs", set())
     if folder and folder not in ready:
-        mkdir = requests.put(
-            YANDEX_API + "/resources",
-            params={"path": "app:/" + folder},
-            headers=yandex_headers(),
-            timeout=20,
+        mkdir = ycall(
+            "put", YANDEX_API + "/resources",
+            params={"path": "app:/" + folder}, headers=yandex_headers(), timeout=20,
         )
         if mkdir.status_code not in (201, 202, 409):
             mkdir.raise_for_status()
         ready.add(folder)
 
-    response = requests.get(
-        YANDEX_API + "/resources/upload",
-        params={"path": "app:/" + path, "overwrite": "true"},
-        headers=yandex_headers(),
-        timeout=20,
-    )
-    response.raise_for_status()
-
-    upload = requests.put(response.json()["href"], data=payload, timeout=60)
-    upload.raise_for_status()
+    # Ссылка для загрузки одноразовая: при сбое запрашиваем новую и повторяем всю пару запросов.
+    last_error = None
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        try:
+            response = requests.get(
+                YANDEX_API + "/resources/upload",
+                params={"path": "app:/" + path, "overwrite": "true"},
+                headers=yandex_headers(), timeout=20,
+            )
+            response.raise_for_status()
+            upload = requests.put(response.json()["href"], data=payload, timeout=60)
+            upload.raise_for_status()
+            return
+        except Exception as error:
+            last_error = error
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            if status is not None and status not in RETRY_STATUSES:
+                raise                       # например, 401/403 — повторять бессмысленно
+            if attempt < len(RETRY_DELAYS):
+                time.sleep(RETRY_DELAYS[attempt])
+    raise last_error
 
 
 def slist(folder="backups"):
@@ -215,11 +243,10 @@ def slist(folder="backups"):
             return []
         return sorted([name for name in os.listdir(full) if name.endswith(".json")], reverse=True)
 
-    response = requests.get(
-        YANDEX_API + "/resources",
+    response = ycall(
+        "get", YANDEX_API + "/resources",
         params={"path": "app:/" + folder, "limit": 1000, "sort": "-name"},
-        headers=yandex_headers(),
-        timeout=20,
+        headers=yandex_headers(), timeout=20,
     )
     if response.status_code == 404:
         return []
@@ -442,16 +469,19 @@ def save():
         current["rev"] = (remote or {}).get("rev", 0) + 1
         sput("data.json", current)
         st.session_state.base = current["rev"]
+        st.session_state["unsaved"] = False
         log("save_ok", ms=int((time.time() - started) * 1000), rev=current["rev"], exp=len(current["exp"]), sav=len(current["sav"]))
         flush_logs()
         return True
 
     except Exception as error:
+        st.session_state["unsaved"] = True
         log("save_fail", error=str(error)[:300])
         flush_logs()
         st.error(
-            f"НЕ СОХРАНЕНО: {error}. Данные пока остались в текущей сессии. "
-            "Не закрывай страницу; проверь подключение и повтори действие."
+            f"НЕ СОХРАНЕНО: {str(error)[:200]}. Приложение уже пробовало несколько раз. "
+            "Изменения остались в приложении: не закрывай страницу и нажми «Повторить сохранение» "
+            "(кнопка появится вверху после обновления экрана) или внеси любое другое изменение."
         )
         return False
 
@@ -591,6 +621,14 @@ E = F[F["t"] == "e"].copy()
 C = F[F["t"] == "cb"].copy()
 I = F[F["t"] == "in"].copy()
 
+# Обязательные (регулярные) траты: платятся раз в месяц крупной суммой, поэтому в прогнозы и темпы их не «размножаем».
+regular_categories = {str(item.get("c")) for item in D["rec"] if isinstance(item, dict)}
+if E.empty:
+    E["reg"] = pd.Series(dtype=bool)
+else:
+    E["reg"] = E["c"].isin(regular_categories) | (E["g"] == "Обязательные") | E["n"].astype(str).str.startswith("авто")
+EV = E[~E["reg"]].copy()          # обычные (переменные) траты
+
 
 def sum_between(frame, start, end):
     if frame.empty:
@@ -679,12 +717,20 @@ year_interest = balance * ((1.0 + daily_rate) ** 365 - 1.0)
 first_expense = F["d"].min() if not F.empty else today
 window_days = min(30, max(1, (today - first_expense).days + 1))
 window_start = today - dt.timedelta(days=window_days - 1)
-daily_spend = sum_between(E, window_start, today) / window_days
-monthly_addition = (
-    max(mc["inc"] - daily_spend * 30.4, 0.0)
-    + sum_between(C, window_start, today) / window_days * 30.4
-)
-daily_limit = cfg["cap"] / 30.0 if cfg["cap"] else 0.0
+variable_daily = sum_between(EV, window_start, today) / window_days          # обычные траты в день
+history_months = min(3.0, max(1.0, (today - first_expense).days / 30.4))
+regular_other = float(E.loc[
+    E["reg"] & (E["d"] >= today - dt.timedelta(days=90)) & ~E["c"].isin(regular_categories), "a"
+].sum()) / history_months
+regular_monthly = sum(safe_float(item.get("a")) for item in D["rec"]) + regular_other   # обязательные: раз в месяц
+cashback_monthly = sum_between(C, window_start, today) / window_days * 30.4
+monthly_expenses_est = variable_daily * 30.4 + regular_monthly
+monthly_addition = max(mc["inc"] - monthly_expenses_est, 0.0) + cashback_monthly
+
+days_in_current = calendar.monthrange(today.year, today.month)[1]
+regular_spent_month = float(E.loc[(E["m"] == current_month) & E["reg"], "a"].sum())
+variable_limit_month = max(cfg["cap"] - regular_spent_month - reserve, 0.0)   # лимит на обычные траты месяца
+daily_limit = variable_limit_month / days_in_current if cfg["cap"] else 0.0
 
 projected_balance = balance
 months_to_goal = 0
@@ -697,9 +743,36 @@ while (
     months_to_goal += 1
 
 
+# Прогноз на год вперёд: ежемесячно добавляем свободные деньги, на всё начисляются проценты.
+year_balance, year_contributions = balance, 0.0
+for _ in range(12):
+    year_balance = year_balance * ((1.0 + daily_rate) ** 30.4) + monthly_addition
+    year_contributions += monthly_addition
+year_interest_total = year_balance - balance - year_contributions       # проценты за год с учётом будущих взносов
+
+
+def set_amount(value):
+    st.session_state["add_amount"] = value
+
+
+def add_to_amount(step_value):
+    st.session_state["add_amount"] = float(st.session_state.get("add_amount") or 0) + step_value
+
+
+def typical_amounts(category, limit=4):
+    """Самые частые суммы трат этой категории (для подстановки одним нажатием)."""
+    rows = E[E["c"] == category]
+    if rows.empty:
+        return []
+    recent = rows[rows["d"] >= today - dt.timedelta(days=180)]
+    source = recent if len(recent) >= 3 else rows
+    stats = source.assign(r=source["a"].round(2)).groupby("r").agg(n=("a", "size"), last=("d", "max")).sort_values(["n", "last"], ascending=False)
+    return [float(value) for value in stats.index[:limit]]
+
+
 def motivation_messages():
     messages = []
-    today_spend = sum_between(E, today, today)
+    today_spend = sum_between(EV, today, today)
     if today_spend > daily_limit:
         messages.append(("warning", f"Сегодня потрачено на {money(today_spend - daily_limit)} больше дневного ориентира."))
     elif today_spend > 0:
@@ -710,19 +783,19 @@ def motivation_messages():
     week_start = today - dt.timedelta(days=today.weekday())
     previous_week_start = week_start - dt.timedelta(days=7)
     elapsed = (today - week_start).days
-    current_week = sum_between(E, week_start, today)
-    previous_week = sum_between(E, previous_week_start, previous_week_start + dt.timedelta(days=elapsed))
+    current_week = sum_between(EV, week_start, today)
+    previous_week = sum_between(EV, previous_week_start, previous_week_start + dt.timedelta(days=elapsed))
 
-    if sum_between(E, previous_week_start, week_start - one_day) > 0:
+    if sum_between(EV, previous_week_start, week_start - one_day) > 0:
         difference = current_week - previous_week
         if difference > 0:
-            messages.append(("warning", f"За неделю потрачено на {money(difference)} больше, чем за такой же период прошлой недели."))
+            messages.append(("warning", f"За неделю обычных трат (без обязательных) на {money(difference)} больше, чем за такой же период прошлой недели."))
         else:
-            messages.append(("info", f"За неделю потрачено на {money(-difference)} меньше. Хорошая динамика!"))
+            messages.append(("info", f"За неделю обычных трат на {money(-difference)} меньше. Хорошая динамика!"))
 
-    current_categories = E.loc[(E["d"] >= week_start) & (E["g"] != "Обязательные")].groupby("c")["a"].sum()
-    previous_categories = E.loc[
-        (E["d"] >= previous_week_start) & (E["d"] <= previous_week_start + dt.timedelta(days=elapsed))
+    current_categories = EV.loc[EV["d"] >= week_start].groupby("c")["a"].sum()
+    previous_categories = EV.loc[
+        (EV["d"] >= previous_week_start) & (EV["d"] <= previous_week_start + dt.timedelta(days=elapsed))
     ].groupby("c")["a"].sum()
     difference_by_category = current_categories.sub(previous_categories, fill_value=0)
 
@@ -785,6 +858,11 @@ def run_ui():
         log("nav", page=page)
         st.session_state["prev_page"] = page
 
+    if st.session_state.get("unsaved"):
+        st.warning("⚠️ Последние изменения ещё не сохранены на Яндекс.Диск. Они остаются в приложении — не закрывай страницу.")
+        if st.button("Повторить сохранение", key="retry_save", type="primary"):
+            commit()
+
     cat_ids = {category: index for index, category in enumerate(sorted(D["cats"]))}
 
 
@@ -811,6 +889,16 @@ def run_ui():
             estimated_date = today + dt.timedelta(days=int(months_to_goal * 30.4))
             caption += f" · ориентир достижения цели: {months_to_goal} мес. ({estimated_date:%m.%Y})"
         st.caption(caption)
+        with st.expander("Как считается ориентир достижения цели"):
+            st.markdown(
+                "Это **прогноз, а не обещание**: когда накопления дойдут до цели, если жить в нынешнем режиме и откладывать все свободные деньги.\n\n"
+                f"1. **Свободные деньги за месяц** ≈ доход {money(mc['inc'])} − обычные траты {money(variable_daily * 30.4)} "
+                f"(среднее за последние {window_days} дн. × 30,4) − обязательные платежи {money(regular_monthly)} (один раз в месяц) "
+                f"+ кешбек {money(cashback_monthly)} = **{money(monthly_addition)}**.\n"
+                f"2. Эта сумма каждый месяц добавляется к накоплениям (сейчас {money(balance)}), а на всё начисляются проценты по ставке {cfg['srate']:g}% годовых.\n"
+                f"3. Считаем месяцы, пока сумма не дойдёт до цели {money(cfg['goal'])}: осталось набрать {money(max(cfg['goal'] - balance, 0))}.\n\n"
+                "Реальные накопления — только то, что ты внёс кнопками «Отложить» и «Положить остаток». Прогноз пересчитывается вместе с твоими тратами."
+            )
 
         st.markdown(
             f"**{month_label(current_month)}** · доход {money(mc['inc'])} · "
@@ -857,13 +945,16 @@ def run_ui():
         if days_left < 3 and rest_net > 0:
             st.info("Конец месяца — можно положить остаток в накопления. Если не откладывать, он перейдёт на следующий месяц.")
 
-        today_spend = sum_between(E, today, today)
+        today_spend = sum_between(EV, today, today)
+        today_regular = sum_between(E[E["reg"]], today, today)
         st.metric(
             "Сегодня потрачено",
             money(today_spend),
-            f"{today_spend - daily_limit:+,.0f} ₽ к дневному ориентиру".replace(",", " "),
+            f"{today_spend - daily_limit:+,.0f} ₽ к дневному ориентиру {money(daily_limit)}".replace(",", " "),
             delta_color="inverse",
         )
+        if today_regular:
+            st.caption(f"Обязательные платежи сегодня ({money(today_regular)}) в этот показатель не входят.")
 
         for message_type, message in motivation_messages():
             (st.warning if message_type == "warning" else st.info)(message)
@@ -948,36 +1039,50 @@ def run_ui():
             st.html(tile_css([item for item in tile_items if item not in quick_keys], picked) + tile_css(sorted(quick_keys)))
 
         if entry_kind in ("Трата", "Кешбек", "Доп. доход", "В накопления", "Из накоплений"):
-            with st.form("add_entry_form", clear_on_submit=True):
-                if entry_kind == "Трата":
-                    if picked:
-                        st.markdown(f"Категория: **{style_of(picked)[0]} {picked}** · {D['cats'][picked]}")
-                    else:
-                        st.warning("Сначала добавь хотя бы одну категорию в разделе «Группы».")
-                amount = st.number_input("Сумма, ₽", min_value=0.0, step=100.0, key="add_amount")
-                entry_date = st.date_input("Дата", today, key="add_date")
-                comment_label = "Источник (подработка, возврат…)" if entry_kind == "Доп. доход" else "Комментарий"
-                comment = st.text_input(comment_label, key="add_comment")
+            if st.session_state.pop("reset_add", False):          # очистка полей после успешного добавления
+                st.session_state["add_amount"] = None
+                st.session_state["add_comment"] = ""
+            if entry_kind == "Трата":
+                if picked:
+                    st.markdown(f"Категория: **{style_of(picked)[0]} {picked}** · {D['cats'][picked]}")
+                else:
+                    st.warning("Сначала добавь хотя бы одну категорию в разделе «Группы».")
+            amount = st.number_input(
+                "Сумма, ₽", min_value=0.0, value=None, step=1.0, format="%g",
+                placeholder="Введи сумму, например 1250", key="add_amount",
+            )
+            typical = typical_amounts(picked) if (entry_kind == "Трата" and picked) else []
+            if typical:
+                st.caption("Частые суммы этой категории — нажми, чтобы подставить")
+                with st.container(horizontal=True):
+                    for index, value in enumerate(typical):
+                        st.button(f"{value:,.0f}".replace(",", " "), key=f"amt_set_{index}", on_click=set_amount, args=(value,))
+            st.caption("Прибавить к сумме")
+            with st.container(horizontal=True):
+                for step_value in (100, 500, 1000, 5000):
+                    st.button(f"+{step_value:,}".replace(",", " "), key=f"amt_add_{step_value}", on_click=add_to_amount, args=(step_value,))
+                st.button("Сбросить", key="amt_clear", on_click=set_amount, args=(None,))
+            entry_date = st.date_input("Дата", today, key="add_date")
+            comment_label = "Источник (подработка, возврат…)" if entry_kind == "Доп. доход" else "Комментарий"
+            comment = st.text_input(comment_label, key="add_comment")
 
-                if st.form_submit_button("Добавить", type="primary"):
-                    if amount <= 0:
-                        log("validation_error", where="add_form", kind=entry_kind)
-                        st.error("Сумма должна быть больше нуля.")
-                    elif entry_kind == "Трата":
-                        if not picked:
-                            st.error("Нет доступных категорий.")
-                        else:
-                            add("exp", via="form", d=str(entry_date), c=picked, a=float(amount), n=comment, t="e")
-                            commit()
+            if st.button("Добавить", type="primary", key="add_submit"):
+                if not amount or amount <= 0:
+                    log("validation_error", where="add_form", kind=entry_kind)
+                    st.error("Введи сумму больше нуля.")
+                elif entry_kind == "Трата" and not picked:
+                    st.error("Нет доступных категорий.")
+                else:
+                    if entry_kind == "Трата":
+                        add("exp", via="form", d=str(entry_date), c=picked, a=float(amount), n=comment, t="e")
                     elif entry_kind == "Кешбек":
                         add("exp", via="form", d=str(entry_date), c="Кешбек", a=float(amount), n=comment, t="cb")
-                        commit()
                     elif entry_kind == "Доп. доход":
                         add("exp", via="form", d=str(entry_date), c="Доп. доход", a=float(amount), n=comment, t="in")
-                        commit()
                     else:
                         add("sav", via="form", d=str(entry_date), a=float(amount), k="dep" if entry_kind == "В накопления" else "wd", n=comment)
-                        commit()
+                    st.session_state["reset_add"] = True
+                    commit()
 
             if entry_kind == "Кешбек":
                 st.caption("Кешбек учитывается как поступление в накопления.")
@@ -1028,9 +1133,12 @@ def run_ui():
         previous_same = E[(E["d"] >= prev_start) & (E["d"] <= prev_cut)]
 
         spent = float(current_expenses["a"].sum())
-        previous_same_total = float(previous_same["a"].sum())
-        mandatory = float(current_expenses.loc[current_expenses["g"] == "Обязательные", "a"].sum())
-        flexible = spent - mandatory
+        current_var = current_expenses[~current_expenses["reg"]]
+        previous_same_var = previous_same[~previous_same["reg"]]
+        variable_spent = float(current_var["a"].sum())
+        regular_spent = spent - variable_spent
+        previous_same_total = float(previous_same_var["a"].sum())
+        mandatory, flexible = regular_spent, variable_spent
         month_income = (
             monthly[selected]["inc"] if selected in monthly
             else safe_float(D["inc"].get(selected, cfg["income"]), cfg["income"]) + float(I.loc[I["m"] == selected, "a"].sum())
@@ -1041,23 +1149,59 @@ def run_ui():
             - float(S.loc[(S["m"] == selected) & (S["k"] == "wd"), "a"].sum())
         )
         save_rate = saved / month_income * 100 if month_income else 0.0
-        pace_plan = cfg["cap"] * elapsed_days / days_in_month
-        projection = spent / elapsed_days * days_in_month if selected == current_month else spent
+        pending_here = reserve if selected == current_month else 0.0          # обязательные, которые ещё впереди
+        var_limit = max(cfg["cap"] - regular_spent - pending_here, 0.0)       # лимит на обычные траты
+        pace_plan = var_limit * elapsed_days / days_in_month
+        variable_projection = variable_spent / elapsed_days * days_in_month if selected == current_month else variable_spent
+        projection = regular_spent + pending_here + variable_projection       # обязательные учитываются один раз
 
         kpi1, kpi2 = st.columns(2)
-        kpi1.metric("Потрачено", money(spent), f"{spent - previous_same_total:+,.0f} ₽ к {month_label(previous_month)} за те же дни".replace(",", " "), delta_color="inverse")
-        kpi2.metric("Темп к лимиту", f"{spent / pace_plan * 100:.0f}%" if pace_plan else "—", f"{spent - pace_plan:+,.0f} ₽ к плану на сегодня".replace(",", " "), delta_color="inverse")
+        kpi1.metric("Потрачено", money(spent), f"обычные {money(variable_spent)} · {variable_spent - previous_same_total:+,.0f} ₽ к {month_label(previous_month)}".replace(",", " "), delta_color="off")
+        kpi2.metric("Темп к лимиту", f"{variable_spent / pace_plan * 100:.0f}%" if pace_plan else "—", f"{variable_spent - pace_plan:+,.0f} ₽ к плану на сегодня".replace(",", " "), delta_color="inverse")
         kpi3, kpi4 = st.columns(2)
         kpi3.metric("Прогноз месяца" if selected == current_month else "Итог месяца", money(projection), f"{projection - cfg['cap']:+,.0f} ₽ к лимиту {money(cfg['cap'])}".replace(",", " "), delta_color="inverse")
         kpi4.metric("Отложено", money(saved), f"{save_rate:.0f}% дохода · цель {cfg['pct']:g}%", delta_color="off")
 
         with st.expander("Как читать эти цифры"):
             st.markdown(
-                "- **Потрачено** — траты месяца и разница с прошлым месяцем *за то же число дней* (так сравнение честное).\n"
-                "- **Темп к лимиту** — 100% значит, что ты идёшь ровно по лимиту; меньше — экономишь, больше — перерасход к этому дню.\n"
-                "- **Прогноз месяца** — во сколько обойдётся месяц, если и дальше тратить в том же темпе.\n"
+                "- **Потрачено** — все траты месяца; ниже «обычные» — без обязательных платежей (ипотека, связь и т.п.) и их разница с прошлым месяцем за те же дни.\n"
+                "- **Темп к лимиту** — обычные траты против плана на сегодня: 100% значит, что идёшь ровно по лимиту, меньше — экономишь. Лимит на обычные траты = лимит месяца − обязательные платежи.\n"
+                "- **Прогноз месяца** = уже потраченные обязательные + ещё предстоящие обязательные (один раз) + обычные траты в нынешнем темпе до конца месяца. Ипотека и другие крупные платежи в прогнозе не повторяются.\n"
                 "- **Отложено** — сколько реально ушло в накопления (с кешбеком) и какую долю дохода это составляет против цели."
             )
+
+        st.markdown("**Последние 7 дней** (без обязательных платежей)")
+        week_days = [today - dt.timedelta(days=i) for i in range(6, -1, -1)]
+        weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        labels7 = [f"{weekday_names[d.weekday()]} {d.day}" for d in week_days]
+        this_week = [sum_between(EV, d, d) for d in week_days]
+        week_before = [sum_between(EV, d - dt.timedelta(days=7), d - dt.timedelta(days=7)) for d in week_days]
+        last7 = pd.DataFrame({"День": labels7, "Траты": this_week, "Неделей ранее": week_before})
+        st.altair_chart(
+            alt.Chart(last7).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+                x=alt.X("День:N", sort=labels7, title=None, axis=alt.Axis(labelAngle=0)), y=alt.Y("Траты:Q", title=None),
+                color=alt.condition(alt.datum["Траты"] > daily_limit, alt.value(RED), alt.value(GREEN)),
+                tooltip=["День", "Траты", "Неделей ранее"],
+            ).properties(height=170),
+            width="stretch",
+        )
+        st.caption(f"Обычные траты за каждый из последних 7 дней. Красный — выше дневного ориентира ({money(daily_limit)}).")
+
+        pct_values = [round(cur / prev * 100, 1) if prev > 0 else None for cur, prev in zip(this_week, week_before)]
+        pct7 = pd.DataFrame({"День": labels7, "Процент": pct_values})
+        st.markdown("**К тому же дню прошлой недели, %**")
+        if pct7["Процент"].notna().any():
+            base_pct = alt.Chart(pct7.dropna()).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+                x=alt.X("День:N", sort=labels7, title=None, axis=alt.Axis(labelAngle=0)), y=alt.Y("Процент:Q", title=None),
+                color=alt.condition(alt.datum["Процент"] > 100, alt.value(RED), alt.value(GREEN)), tooltip=["День", "Процент"],
+            )
+            pct_text = alt.Chart(pct7.dropna()).mark_text(dy=-6).encode(x=alt.X("День:N", sort=labels7), y="Процент:Q", text=alt.Text("Процент:Q", format=".0f"))
+            rule100 = alt.Chart(pd.DataFrame({"y": [100]})).mark_rule(strokeDash=[5, 4], color="#9ca3af").encode(y="y:Q")
+            st.altair_chart((base_pct + pct_text + rule100).properties(height=190), width="stretch")
+            missing = [label for label, value in zip(labels7, pct_values) if value is None]
+            st.caption("100% — столько же, сколько в этот день неделей раньше; выше 100% (красный) — потратил больше, ниже (зелёный) — меньше." + (f" Нет данных для сравнения: {', '.join(missing)}." if missing else ""))
+        else:
+            st.caption("Не с чем сравнивать: неделей ранее обычных трат не было.")
 
         st.markdown("**Где уходят деньги**")
         by_group = current_expenses.groupby("g")["a"].sum().sort_values(ascending=False).reset_index()
@@ -1073,8 +1217,8 @@ def run_ui():
             st.altair_chart((bars + labels).properties(height=max(120, 34 * len(by_group))), width="stretch")
             st.caption(f"Обязательные: **{money(mandatory)}** ({mandatory / spent:.0%}) · гибкие: **{money(flexible)}** ({flexible / spent:.0%}). Экономить проще на гибких.")
 
-            st.markdown("**Что изменилось к прошлому месяцу** (за те же дни)")
-            diff = pd.DataFrame({"Сейчас": current_expenses.groupby("c")["a"].sum(), "Было": previous_same.groupby("c")["a"].sum()}).fillna(0)
+            st.markdown("**Что изменилось к прошлому месяцу** (обычные траты, за те же дни)")
+            diff = pd.DataFrame({"Сейчас": current_var.groupby("c")["a"].sum(), "Было": previous_same_var.groupby("c")["a"].sum()}).fillna(0)
             diff["Разница"] = diff["Сейчас"] - diff["Было"]
             growth = diff[diff["Разница"] > 0].sort_values("Разница", ascending=False).head(5)
             decline = diff[diff["Разница"] < 0].sort_values("Разница").head(3)
@@ -1086,7 +1230,7 @@ def run_ui():
                 st.dataframe(changes.round(0), hide_index=True, width="stretch")
                 st.caption("Сверху — категории, где траты выросли сильнее всего: первые кандидаты на экономию. Снизу — где стало меньше.")
 
-            top_flex = current_expenses[current_expenses["g"] != "Обязательные"].groupby("c")["a"].sum().sort_values(ascending=False).head(3)
+            top_flex = current_var.groupby("c")["a"].sum().sort_values(ascending=False).head(3)
             if not top_flex.empty:
                 potential = float(top_flex.sum()) * 0.2
                 names = ", ".join(f"«{name}»" for name in top_flex.index)
@@ -1095,17 +1239,17 @@ def run_ui():
                     tip += f" — цель приблизится примерно на {potential * 30.4 / monthly_addition:.0f} дн."
                 st.info(tip)
 
-        st.markdown("**Траты по дням**")
+        st.markdown("**Обычные траты по дням месяца**")
         daily_data = pd.DataFrame({"День": range(1, days_in_month + 1)})
         daily_data["Траты"] = [
-            float(current_expenses.loc[current_expenses["d"] == dt.date(year, month_number, day_number), "a"].sum())
+            float(current_var.loc[current_var["d"] == dt.date(year, month_number, day_number), "a"].sum())
             for day_number in daily_data["День"]
         ]
         daily_data["Накопительно"] = daily_data["Траты"].cumsum()
-        daily_data["Лимит"] = [cfg["cap"] / days_in_month * day_number for day_number in daily_data["День"]]
+        daily_data["Лимит"] = [var_limit / days_in_month * day_number for day_number in daily_data["День"]]
         if selected == current_month:
             daily_data.loc[daily_data["День"] > today.day, "Накопительно"] = None
-        day_limit = cfg["cap"] / days_in_month if days_in_month else 0
+        day_limit = var_limit / days_in_month if days_in_month else 0
         st.altair_chart(
             alt.Chart(daily_data).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
                 x=alt.X("День:O", axis=alt.Axis(labelAngle=0, values=list(range(1, days_in_month + 1, 3)))),
@@ -1115,7 +1259,7 @@ def run_ui():
             ).properties(height=170),
             width="stretch",
         )
-        st.caption("Красные дни — выше дневного лимита. Видно, в какие дни случаются «пробои» бюджета.")
+        st.caption("Без обязательных платежей. Красные дни — выше дневного лимита на обычные траты: видно, когда случаются «пробои» бюджета.")
         line_data = daily_data.melt("День", ["Накопительно", "Лимит"], "Показатель", "Значение")
         st.altair_chart(
             alt.Chart(line_data).mark_line(strokeWidth=3).encode(
@@ -1126,9 +1270,9 @@ def run_ui():
             ).properties(height=170),
             width="stretch",
         )
-        st.caption("Синяя линия выше пунктирной — ты тратишь быстрее плана и рискуешь выйти за лимит месяца.")
+        st.caption("Синяя линия выше пунктирной — обычные траты идут быстрее плана, и есть риск выйти за лимит месяца.")
 
-        weekday_window = E[E["d"] >= today - dt.timedelta(days=84)]
+        weekday_window = EV[EV["d"] >= today - dt.timedelta(days=84)]
         if not weekday_window.empty:
             names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
             by_weekday = weekday_window.groupby(weekday_window["d"].map(lambda value: value.weekday()))["a"].sum() / 12
@@ -1140,7 +1284,7 @@ def run_ui():
                 ).properties(height=150),
                 width="stretch",
             )
-            st.caption("Средние траты по дням недели за последние 12 недель — помогает понять привычки (например, выходные).")
+            st.caption("Средние обычные траты по дням недели за последние 12 недель — помогает понять привычки (например, выходные).")
 
         if not current_expenses.empty:
             st.markdown("**Крупнейшие траты месяца**")
@@ -1185,7 +1329,15 @@ def run_ui():
         st.metric("Накоплено", money(balance), f"проценты {money(interest)}", delta_color="off")
         savings_col1, savings_col2 = st.columns(2)
         savings_col1.metric("Вложено своих", money(principal))
-        savings_col2.metric("Доход за год при текущей сумме", money(year_interest), f"≈ {money(year_interest / 12)} в месяц", delta_color="off")
+        savings_col2.metric("Проценты за год на текущую сумму", money(year_interest), f"≈ {money(year_interest / 12)} в месяц", delta_color="off")
+        forecast_col1, forecast_col2 = st.columns(2)
+        forecast_col1.metric("Доход с вклада за год (прогноз)", money(year_interest_total), "с учётом будущих взносов", delta_color="off")
+        forecast_col2.metric("Накопления через год (прогноз)", money(year_balance), f"взносы +{money(year_contributions)} · проценты +{money(year_interest_total)}", delta_color="off")
+        st.caption(
+            f"Прогноз на 12 месяцев: сейчас {money(balance)}, каждый месяц добавляется ≈ {money(monthly_addition)} "
+            f"(свободные деньги при нынешних тратах), ставка {cfg['srate']:g}% годовых с ежедневной капитализацией. "
+            "Обязательные платежи учтены один раз в месяц. Это ориентир, а не обещание."
+        )
 
         with st.expander("Ставка и стартовая сумма", expanded=False):
             with st.form("savings_settings_form"):
@@ -1484,18 +1636,21 @@ def run_ui():
 
         refresh_col, download_col = st.columns(2)
         if refresh_col.button("🔄 Обновить с Яндекс.Диска", key="refresh_remote"):
-            try:
-                remote_data = sget("data.json")
-                if remote_data is None:
-                    st.warning("На Яндекс.Диске пока нет основного файла.")
-                else:
-                    st.session_state.D = migrate(remote_data)
-                    st.session_state.base = remote_data.get("rev", 0)
-                    log("refresh_remote")
-                    st.rerun()
-            except Exception as error:
-                log("refresh_fail", error=str(error)[:200])
-                st.error(f"Не удалось обновить данные: {error}")
+            if st.session_state.get("unsaved"):
+                st.error("Есть несохранённые изменения — сначала нажми «Повторить сохранение» вверху, иначе они пропадут.")
+            else:
+                try:
+                    remote_data = sget("data.json")
+                    if remote_data is None:
+                        st.warning("На Яндекс.Диске пока нет основного файла.")
+                    else:
+                        st.session_state.D = migrate(remote_data)
+                        st.session_state.base = remote_data.get("rev", 0)
+                        log("refresh_remote")
+                        st.rerun()
+                except Exception as error:
+                    log("refresh_fail", error=str(error)[:200])
+                    st.error(f"Не удалось обновить данные: {error}")
         download_col.download_button("⬇️ Скачать полную копию", json.dumps(D, ensure_ascii=False, indent=2), "million-backup.json", mime="application/json", key="download_backup")
 
         backup_file = st.file_uploader("Восстановить из файла копии (JSON)", type="json", key="json_backup_upload")
