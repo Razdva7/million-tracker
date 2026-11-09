@@ -646,7 +646,7 @@ for month in month_range(start_month_date, today):
 
     expenses = float(E.loc[E["m"] == month, "a"].sum())
     saved_percent = float(S.loc[(S["m"] == month) & (S["k"] == "p25"), "a"].sum())
-    other_saving = float(S.loc[(S["m"] == month) & S["k"].isin(["dep", "rest"]), "a"].sum())
+    other_saving = float(S.loc[(S["m"] == month) & S["k"].isin(["dep", "rest", "bonus"]), "a"].sum())
     withdrawals = float(S.loc[(S["m"] == month) & (S["k"] == "wd"), "a"].sum())
 
     cash = carry + income_total - expenses - saved_percent - other_saving + withdrawals
@@ -732,6 +732,14 @@ regular_spent_month = float(E.loc[(E["m"] == current_month) & E["reg"], "a"].sum
 variable_limit_month = max(cfg["cap"] - regular_spent_month - reserve, 0.0)   # лимит на обычные траты месяца
 daily_limit = variable_limit_month / days_in_current if cfg["cap"] else 0.0
 
+# «Поощрение»: сколько обычных трат сэкономлено относительно плана на сегодня и какую сумму разумно отложить сверху.
+variable_spent_month = float(EV.loc[EV["m"] == current_month, "a"].sum())
+pace_plan_today = variable_limit_month * today.day / days_in_current
+saved_vs_plan = max(pace_plan_today - variable_spent_month, 0.0)
+bonus_done = float(S.loc[(S["m"] == current_month) & (S["k"] == "bonus"), "a"].sum())   # поощрения этого месяца уже отложены
+bonus_suggestion = min(max(saved_vs_plan - bonus_done, 0.0), max(rest_net, 0.0))
+bonus_suggestion = float(int(bonus_suggestion // 100 * 100)) if bonus_suggestion >= 100 else 0.0
+
 projected_balance = balance
 months_to_goal = 0
 while (
@@ -753,6 +761,13 @@ year_interest_total = year_balance - balance - year_contributions       # про
 
 def set_amount(value):
     st.session_state["add_amount"] = value
+
+
+def goto_bonus(amount):
+    """Переход на «Внести» → «Поощрение» с подставленной суммой (вызывается как обработчик кнопки)."""
+    st.session_state["nav"] = "➕ Внести"
+    st.session_state["entry_kind"] = "Поощрение"
+    st.session_state["add_amount"] = float(amount) if amount else None
 
 
 def add_to_amount(step_value):
@@ -928,6 +943,9 @@ def run_ui():
             commit()
 
         days_left = calendar.monthrange(today.year, today.month)[1] - today.day
+        if bonus_suggestion > 0:
+            st.info(f"🎉 Обычные траты на {money(saved_vs_plan)} ниже плана на сегодня. Можно поощрить накопления — например, на {money(bonus_suggestion)}.")
+            st.button("Отложить сэкономленное…", key="goto_bonus", on_click=goto_bonus, args=(bonus_suggestion,))
         if rest_net > 0:
             st.caption(f"≈ {money(rest_net / (days_left + 1))} в день до конца месяца — столько реально можно потратить.")
         elif rest_net < 0:
@@ -989,7 +1007,7 @@ def run_ui():
     if page == P_ADD:
         entry_kind = st.radio(
             "Что вносим",
-            ["Трата", "Кешбек", "Доп. доход", "Доход месяца", "В накопления", "Из накоплений"],
+            ["Трата", "Кешбек", "Доп. доход", "Доход месяца", "В накопления", "Поощрение", "Из накоплений"],
             horizontal=True,
             label_visibility="collapsed",
             key="entry_kind",
@@ -1038,7 +1056,7 @@ def run_ui():
             quick_keys = {item for item in tile_items if item[0].startswith("quick_")}
             st.html(tile_css([item for item in tile_items if item not in quick_keys], picked) + tile_css(sorted(quick_keys)))
 
-        if entry_kind in ("Трата", "Кешбек", "Доп. доход", "В накопления", "Из накоплений"):
+        if entry_kind in ("Трата", "Кешбек", "Доп. доход", "В накопления", "Поощрение", "Из накоплений"):
             if st.session_state.pop("reset_add", False):          # очистка полей после успешного добавления
                 st.session_state["add_amount"] = None
                 st.session_state["add_comment"] = ""
@@ -1051,6 +1069,26 @@ def run_ui():
                 "Сумма, ₽", min_value=0.0, value=None, step=1.0, format="%g",
                 placeholder="Введи сумму, например 1250", key="add_amount",
             )
+            if entry_kind == "Поощрение":
+                st.caption(
+                    "Поощрение — небольшой дополнительный взнос в накопления из зарплаты за то, что ты сэкономил на других тратах. "
+                    f"Он уменьшает остаток после трат (сейчас {money(rest_net)})."
+                )
+                if bonus_suggestion > 0:
+                    st.caption(
+                        f"Обычные траты сейчас на {money(saved_vs_plan)} ниже плана на сегодня"
+                        + (f", поощрений в этом месяце уже отложено {money(bonus_done)}" if bonus_done else "")
+                        + f" — можно отложить до {money(bonus_suggestion)}."
+                    )
+                    with st.container(horizontal=True):
+                        st.button(f"Всё сэкономленное · {bonus_suggestion:,.0f}".replace(",", " "), key="bonus_all", on_click=set_amount, args=(bonus_suggestion,))
+                        if bonus_suggestion >= 200:
+                            half = float(int(bonus_suggestion / 2 // 50 * 50)) or bonus_suggestion
+                            st.button(f"Половина · {half:,.0f}".replace(",", " "), key="bonus_half", on_click=set_amount, args=(half,))
+                else:
+                    st.caption("Пока экономии относительно плана нет — но ты можешь отложить любую сумму, если хочешь себя поощрить.")
+                if amount and amount > max(rest_net, 0):
+                    st.warning(f"Сумма больше текущего остатка ({money(rest_net)}) — остаток после трат уйдёт в минус.")
             typical = typical_amounts(picked) if (entry_kind == "Трата" and picked) else []
             if typical:
                 st.caption("Частые суммы этой категории — нажми, чтобы подставить")
@@ -1080,7 +1118,8 @@ def run_ui():
                     elif entry_kind == "Доп. доход":
                         add("exp", via="form", d=str(entry_date), c="Доп. доход", a=float(amount), n=comment, t="in")
                     else:
-                        add("sav", via="form", d=str(entry_date), a=float(amount), k="dep" if entry_kind == "В накопления" else "wd", n=comment)
+                        kind_code = {"В накопления": "dep", "Поощрение": "bonus"}.get(entry_kind, "wd")
+                        add("sav", via="form", d=str(entry_date), a=float(amount), k=kind_code, n=comment)
                     st.session_state["reset_add"] = True
                     commit()
 
@@ -1367,7 +1406,7 @@ def run_ui():
             )
 
         st.markdown("**Операции**")
-        operation_labels = {"dep": "Положил", "wd": "Снял", "p25": "Отложил %", "rest": "Остаток"}
+        operation_labels = {"dep": "Положил", "wd": "Снял", "p25": "Отложил %", "rest": "Остаток", "bonus": "Поощрение"}
         for entry in D["sav"][-15:][::-1]:
             left, right = st.columns([6, 1])
             label = operation_labels.get(entry.get("k"), entry.get("k", "Операция"))
