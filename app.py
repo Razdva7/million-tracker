@@ -1,3 +1,5 @@
+import copy
+import hashlib
 import json
 import re
 import os
@@ -14,7 +16,7 @@ import pandas as pd
 import altair as alt
 import streamlit as st
 
-APP_VERSION = "7.0"
+APP_VERSION = "11.0"
 
 # ========================= Настройки интерфейса =========================
 
@@ -371,41 +373,85 @@ def migrate(data):
     return result
 
 
-def merge(local_data, remote_data):
-    """Объединяет записи двух устройств. Свои (локальные) записи не теряются никогда."""
+def _merge_lists(base, local, remote):
+    """Трёхстороннее слияние списков записей по id: что я не менял — беру из облака, что менял — оставляю моё."""
+    key = lambda item: str(item.get("id"))
+    base_map = {key(x): x for x in (base or []) if isinstance(x, dict)}
+    local_map = {key(x): x for x in local if isinstance(x, dict)}
+    remote_map = {key(x): x for x in remote if isinstance(x, dict)}
+    out = {}
+    for entry_id in list(local_map) + [k for k in remote_map if k not in local_map]:
+        mine, theirs, was = local_map.get(entry_id), remote_map.get(entry_id), base_map.get(entry_id)
+        if mine is not None and theirs is not None:
+            out[entry_id] = theirs if (was is not None and mine == was) else mine
+        elif mine is not None:                      # нет в облаке
+            if was is None or mine != was:          # новая или изменённая мной — не теряем
+                out[entry_id] = mine
+        elif theirs is not None:                    # нет у меня
+            if was is None:                         # новая из облака
+                out[entry_id] = theirs
+            elif theirs != was:                     # я удалил, но в облаке её правили — оставляем
+                out[entry_id] = theirs
+    return list(out.values())
+
+
+def _merge_dicts(base, local, remote):
+    base = base or {}
+    out = {}
+    for name in list(remote) + [k for k in local if k not in remote]:
+        in_l, in_r = name in local, name in remote
+        was = base.get(name, None)
+        if in_l and in_r:
+            out[name] = remote[name] if (name in base and local[name] == was) else local[name]
+        elif in_l:
+            if name not in base or local[name] != was:
+                out[name] = local[name]
+        elif name not in base or remote[name] != was:
+            out[name] = remote[name]
+    return out
+
+
+def merge(local_data, remote_data, base_data=None):
+    """Объединяет версии данных. С base_data (снимок на момент загрузки) слияние трёхстороннее:
+    устаревшая вкладка больше не затирает чужие правки; свои изменения не теряются."""
     local_data = migrate(local_data)
     remote_data = migrate(remote_data)
+    base_data = migrate(base_data) if isinstance(base_data, dict) else None
     out = dict(local_data)
+    get_base = lambda key: base_data[key] if base_data is not None else None
 
-    deleted = {
-        str(item.get("id"))
-        for item in local_data["trash"] + remote_data["trash"]
-        if isinstance(item, dict) and "id" in item
-    }
+    # без снимка (старый режим) удалённое из корзины исключаем только при совпадении id, суммы и даты
+    trashed = {}
+    for item in local_data["trash"] + remote_data["trash"]:
+        if isinstance(item, dict) and "id" in item:
+            trashed[str(item["id"])] = (str(item.get("e", {}).get("d")), item.get("e", {}).get("a"))
 
     for key in ("exp", "sav"):
-        combined = {str(entry.get("id")): entry for entry in local_data[key]}
-        for entry in remote_data[key]:
-            entry_id = str(entry.get("id"))
-            if entry_id not in combined and entry_id not in deleted:
-                combined[entry_id] = entry
-        out[key] = sorted(
-            combined.values(),
-            key=lambda entry: (str(entry.get("d", "")), int(entry.get("id", 0))),
-        )
+        if base_data is not None:
+            merged = _merge_lists(get_base(key), local_data[key], remote_data[key])
+        else:
+            combined = {str(entry.get("id")): entry for entry in local_data[key]}
+            for entry in remote_data[key]:
+                entry_id = str(entry.get("id"))
+                if entry_id not in combined and trashed.get(entry_id) != (str(entry.get("d")), entry.get("a")):
+                    combined[entry_id] = entry
+            merged = list(combined.values())
+        out[key] = sorted(merged, key=lambda entry: (str(entry.get("d", "")), int(entry.get("id", 0))))
 
-    trash_by_id = {}
-    for item in remote_data["trash"] + local_data["trash"]:
-        if isinstance(item, dict) and "id" in item:
-            trash_by_id[str(item["id"])] = item
-    out["trash"] = list(trash_by_id.values())[-500:]
-
-    out["inc"] = {**remote_data["inc"], **local_data["inc"]}
-    out["cats"] = {**remote_data["cats"], **local_data["cats"]}
-    out["bud"] = {**remote_data["bud"], **local_data["bud"]}
-    out["style"] = {**remote_data["style"], **local_data["style"]}
-    out["rec"] = local_data["rec"]
-    out["cfg"] = {**remote_data["cfg"], **local_data["cfg"]}
+    if base_data is not None:
+        out["trash"] = _merge_lists(get_base("trash"), local_data["trash"], remote_data["trash"])[-500:]
+        out["rec"] = _merge_lists(get_base("rec"), local_data["rec"], remote_data["rec"])
+        for key in ("inc", "cats", "bud", "style", "cfg"):
+            out[key] = _merge_dicts(get_base(key), local_data[key], remote_data[key])
+    else:
+        trash_by_id = {}
+        for item in remote_data["trash"] + local_data["trash"]:
+            if isinstance(item, dict) and "id" in item:
+                trash_by_id[str(item["id"])] = item
+        out["trash"] = list(trash_by_id.values())[-500:]
+        for key in ("inc", "cats", "bud", "style", "cfg"):
+            out[key] = {**remote_data[key], **local_data[key]}
+        out["rec"] = local_data["rec"]
     out["rev"] = max(local_data.get("rev", 0), remote_data.get("rev", 0))
     return out
 
@@ -448,6 +494,7 @@ if "D" not in st.session_state:
 
     st.session_state.D = migrate(loaded if loaded else default_data())
     st.session_state.base = (loaded or {}).get("rev", 0)
+    st.session_state["snap"] = copy.deepcopy(st.session_state.D)
     log("load_ok", ms=int((time.time() - load_started) * 1000), exp=len(st.session_state.D["exp"]),
         sav=len(st.session_state.D["sav"]), rev=st.session_state.base)
 
@@ -467,9 +514,10 @@ def save():
         current = st.session_state.D
 
         if remote and remote.get("rev", 0) != st.session_state.get("base", 0):
-            current = merge(current, remote)
+            current = merge(current, remote, st.session_state.get("snap"))
             st.session_state.D = current
-            log("merge_conflict", remote_rev=remote.get("rev"), base=st.session_state.get("base"))
+            log("merge_conflict", remote_rev=remote.get("rev"), base=st.session_state.get("base"),
+                gap=remote.get("rev", 0) - st.session_state.get("base", 0))
             st.info("Данные изменились на другом устройстве — записи объединены.")
 
         if remote:
@@ -479,6 +527,7 @@ def save():
         current["rev"] = (remote or {}).get("rev", 0) + 1
         sput("data.json", current)
         st.session_state.base = current["rev"]
+        st.session_state["snap"] = copy.deepcopy(current)
         st.session_state["unsaved"] = False
         log("save_ok", ms=int((time.time() - started) * 1000), rev=current["rev"], exp=len(current["exp"]), sav=len(current["sav"]))
         flush_logs()
@@ -1516,8 +1565,12 @@ def run_ui():
         st.download_button("Скачать CSV", history[["d", "c", "a", "n", "t"]].to_csv(index=False).encode("utf-8-sig"), "expenses.csv", mime="text/csv", key="download_csv")
 
         editable = history.head(300)[["id", "d", "c", "a", "n"]].assign(Удалить=False).set_index("id")
+        # Ключ таблицы зависит от набора и содержимого строк: иначе Streamlit помнит правки по НОМЕРУ строки
+        # и после сохранения/фильтра применяет их к чужим записям (суммы «прыгают», записи удаляются сами).
+        history_sig = int(hashlib.md5(repr(tuple((int(i), str(r.d), r.c, float(r.a), str(r.n)) for i, r in editable.iterrows())).encode()).hexdigest()[:8], 16)
+        editor_key = f"history_editor_{st.session_state.get('history_gen', 0)}_{history_sig}"
         edited_history = st.data_editor(
-            editable, hide_index=True, width="stretch", key="history_editor",
+            editable, hide_index=True, width="stretch", key=editor_key,
             column_config={
                 "d": st.column_config.DateColumn("Дата"),
                 "c": st.column_config.SelectboxColumn("Категория", options=sorted(set(D["cats"]) | set(F["c"]) | {"Кешбек", "Доп. доход"})),
@@ -1529,13 +1582,14 @@ def run_ui():
 
         if st.button("Сохранить изменения", type="primary", key="save_history"):
             by_id = {str(entry["id"]): entry for entry in D["exp"]}
-            invalid = False
+            invalid, changed_rows, deleted_rows = False, 0, 0
             for row_id, row in edited_history.iterrows():
                 entry = by_id.get(str(row_id))
                 if entry is None:
                     continue
                 if row["Удалить"]:
                     trash("exp", entry)
+                    deleted_rows += 1
                     continue
                 try:
                     amount = float(row["a"])
@@ -1548,13 +1602,19 @@ def run_ui():
                     st.error(f"Проверь запись {row_id}: {error}")
                     invalid = True
                     break
-                entry.update(
+                new_values = dict(
                     d=str(parsed_date), c=category, a=amount, n="" if pd.isna(row["n"]) else str(row["n"]),
                     t="cb" if category == "Кешбек" else "in" if category == "Доп. доход" else "e",
                 )
+                # меняем только то, что реально поменялось (сравнение по id, а не по позиции строки)
+                if any(entry.get(k) != v for k, v in new_values.items() if k != "t") or entry.get("t") != new_values["t"]:
+                    log("history_edit", old=entry.get("a"), new=amount)
+                    entry.update(new_values)
+                    changed_rows += 1
             if not invalid:
                 D["exp"].sort(key=lambda item: (item["d"], item["id"]))
-                log("history_saved")
+                st.session_state["history_gen"] = st.session_state.get("history_gen", 0) + 1
+                log("history_saved", changed=changed_rows, deleted=deleted_rows)
                 commit()
 
         st.caption("Удалённые записи попадают в корзину в разделе «Ещё».")
@@ -1811,6 +1871,7 @@ def run_ui():
                         remote_now = sget("data.json")
                         st.session_state.base = (remote_now or {}).get("rev", 0)
                         st.session_state.D = migrate(preview)
+                        st.session_state["snap"] = copy.deepcopy(st.session_state.D)
                         log("backup_restore", mode="all")
                         commit()
                     except Exception as error:
@@ -1838,6 +1899,7 @@ def run_ui():
                     else:
                         st.session_state.D = migrate(remote_data)
                         st.session_state.base = remote_data.get("rev", 0)
+                        st.session_state["snap"] = copy.deepcopy(st.session_state.D)
                         log("refresh_remote")
                         st.rerun()
                 except Exception as error:
