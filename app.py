@@ -495,6 +495,14 @@ if "D" not in st.session_state:
     st.session_state.D = migrate(loaded if loaded else default_data())
     st.session_state.base = (loaded or {}).get("rev", 0)
     st.session_state["snap"] = copy.deepcopy(st.session_state.D)
+    _w = (loaded or {}).get("_w")
+    if isinstance(_w, dict) and _w.get("rev") != (loaded or {}).get("rev"):
+        log("foreign_write", file_rev=(loaded or {}).get("rev"), mark_rev=_w.get("rev"), mark_v=_w.get("v"), mark_ts=_w.get("ts"))
+        st.session_state["note"] = (
+            f"⚠️ Последнюю запись данных (версия {(loaded or {}).get('rev')}) сделала другая копия приложения без метки, "
+            f"а не эта (последняя метка: версия {_w.get('v')}, {str(_w.get('ts', ''))[:16]}). "
+            "Где-то запущена старая копия приложения — останови её на share.streamlit.io, иначе она может возвращать старые суммы."
+        )
     log("load_ok", ms=int((time.time() - load_started) * 1000), exp=len(st.session_state.D["exp"]),
         sav=len(st.session_state.D["sav"]), rev=st.session_state.base)
 
@@ -525,6 +533,8 @@ def save():
             sput("backups/" + backup_name, remote)
 
         current["rev"] = (remote or {}).get("rev", 0) + 1
+        current["_w"] = {"v": APP_VERSION, "sid": st.session_state.get("sid", ""), "rev": current["rev"],
+                         "ts": dt.datetime.now().isoformat(timespec="seconds")}
         sput("data.json", current)
         st.session_state.base = current["rev"]
         st.session_state["snap"] = copy.deepcopy(current)
@@ -552,7 +562,8 @@ def commit():
 
 
 def add(kind, via="manual", **values):
-    D[kind].append({"id": uid(), **values})
+    new_entry = {"id": uid(), **values}
+    D[kind].append(new_entry)
     D[kind].sort(key=lambda item: (str(item.get("d", "")), int(item.get("id", 0))))
     try:
         days_back = (dt.date.today() - dt.date.fromisoformat(str(values.get("d")))).days
@@ -560,6 +571,7 @@ def add(kind, via="manual", **values):
         days_back = None
     log("entry_add", kind=kind, type=values.get("t") or values.get("k"), cat=values.get("c"),
         amount=values.get("a"), via=via, comment=bool(values.get("n")), days_back=days_back)
+    return new_entry
 
 
 def trash(kind, entry):
@@ -1160,15 +1172,30 @@ def run_ui():
                 picked = ranked[0] if ranked else None
             tile_items = []
 
+            last_quick = st.session_state.get("last_quick")
+            if last_quick:
+                quick_entry = next((e for e in D["exp"] if e["id"] == last_quick), None)
+                if quick_entry is None:
+                    st.session_state.pop("last_quick", None)
+                else:
+                    st.info(f"⚡ Только что добавлено одним нажатием: **{quick_entry['c']} · {money(quick_entry['a'])}** за {quick_entry['d']} (без комментария). "
+                            "Если нажал случайно — отмени.")
+                    if st.button("↩ Отменить это добавление", key="quick_undo"):
+                        trash("exp", quick_entry)
+                        st.session_state.pop("last_quick", None)
+                        log("quick_undo")
+                        commit()
+
             quick = quick_expenses(6)
             if quick:
-                st.caption("⚡ Быстро — одним нажатием (разные траты, самые частые)")
+                st.caption("⚡ Быстро: нажатие СРАЗУ добавляет трату на сегодня с этой суммой и без комментария. Чтобы выбрать категорию и ввести свою сумму — плитки ниже.")
                 with st.container(horizontal=True):
                     for index, (category, amount) in enumerate(quick):
                         key = f"quick_{index}"
                         tile_items.append((key, category))
-                        if st.button(f"{style_of(category)[0]} {category} · {amount:,.0f}".replace(",", " "), key=key):
-                            add("exp", via="quick", d=str(today), c=category, a=float(amount), n="", t="e")
+                        if st.button(f"＋ {style_of(category)[0]} {category} · {amount:,.0f}".replace(",", " "), key=key):
+                            made = add("exp", via="quick", d=str(today), c=category, a=float(amount), n="", t="e")
+                            st.session_state["last_quick"] = made["id"]
                             commit()
 
             st.caption("Категория — сверху те, которыми пользуешься чаще")
@@ -1256,6 +1283,7 @@ def run_ui():
                         kind_code = {KIND_DEP: "dep", "Поощрение": "bonus"}.get(entry_kind, "wd")
                         add("sav", via="form", d=str(entry_date), a=float(amount), k=kind_code, n=comment)
                     st.session_state["reset_add"] = True
+                    st.session_state.pop("last_quick", None)
                     commit()
 
 
